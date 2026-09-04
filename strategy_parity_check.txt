@@ -1,0 +1,39 @@
+LIVE TP FAK NO-MATCH RETRY — parity check
+==============================================================================
+
+Base: polymarket_multi7_abce_paper_live_telegram_tp_v1
+New:  polymarket_multi7_abce_paper_live_telegram_tp_retry_v2
+
+Only two AST-level functions differ:
+- execute_live_fak: exception classification adds deterministic TP SELL FAK no-match retry-safe path.
+- is_definite_fak_no_match_error: new narrow classifier for the exact no-match FAK message.
+
+All strategy and TP-condition functions remain byte-exact:
+- _strategy_set: EXACT | SHA256 2a70385c0b7b2069bfa29adfe4f594eadf6d2b8c42a0e7333fefa368f2c83f60
+- _first_v2_eligible_candidates: EXACT | SHA256 0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
+- evaluate_variant: EXACT | SHA256 5ba451da03557ee0a9d166025225b4ec6b24a36386ccb105d7895bf1f8d98339
+- consensus_confirmations: EXACT | SHA256 aa5285217041b963e8e4f8cd12e662c36635ad635a169d190abd4f7c0bb67c92
+- evaluate_consensus_variant: EXACT | SHA256 f1741c20b88a6f61aa977ac0f32f8b9d9d0771c2533d46fe05312abdbfacb9e2
+- strategy_loop: EXACT | SHA256 9150d730c6d37f1dce29ac98e9bd9d52f3a9ba00fa44e0238e6b56810c4186cc
+- maybe_take_profit: EXACT | SHA256 d83e7c3c79c258acd9968b070eb39e4458663a9d3ef55595fe11b54376e46e72
+- projected_full_exit: EXACT | SHA256 aeb58eb85d2212f851467eb1d1d6247fec79fb9fc44006c6752e49267d86a7d3
+- take_profit_latched: EXACT | SHA256 66f846c20c66d5fae89c48bc663c462bdbf7bf892bd1fe96a359681b7db60deb
+- execute_paper_take_profit: EXACT | SHA256 763ab5520dc97673750463e4c50f1b93d052653839b822cf082fea844dd1c4ea
+- execute_paper: EXACT | SHA256 5b3474f90b6f5066c0420ad057ba50df34b853b5cf778b62982466dbb42ed0bc
+- execute_order: EXACT | SHA256 dd53cbb8b67321522e330bd34fa354e9d395b34714c508b2f073b28e8a5b9a53
+- fee_usdc: EXACT | SHA256 a5464e05087689efa912810a191550d7029de9c2aaadf5759676c16ea8df9e2d
+- momentum_for: EXACT | SHA256 02c2535f3d95f418ed9a6c4252b864104c4e336a29e6a4735035c17110acdf90
+- simulate_buy: EXACT | SHA256 636792028bd7e85f16b31c2480f04ff99c09388ec845b16c0b3ec6a5429bb3ce
+- simulate_sell: EXACT | SHA256 0c2b27a0882e702c1ca4c0a349f5919fd518422bdccb68a67c57d2f6b38e14cf
+
+Behavioral scope of the change:
+- ONLY SELL + TAKE_PROFIT + deterministic "no orders found to match with FAK order" is retry-safe.
+- It is stored as REJECTED_NO_MATCH with zero fill, not AMBIGUOUS.
+- maybe_take_profit remains unchanged and therefore re-checks NET TP each later ~3s cycle.
+- If NET TP is no longer >= target, no retry occurs.
+- If NET TP becomes valid again, retry resumes.
+- A true timeout/503/transport/unknown submission remains AMBIGUOUS and fail-closed.
+- BUY ENTRY ambiguity behavior is unchanged.
+- Partial successful LIVE TP behavior/latch is unchanged.
+
+Regression: LIVE TP deterministic FAK no-match retry regression: OK
