@@ -176,30 +176,3 @@ the tick so normalization never exceeds the configured slippage cap.
 Errors raised while building/signing the order, before any `post_order` call, are
 recorded as `REJECTED_LOCAL` and are not treated as ambiguous submissions.
 Unknown failures after submission remain fail-closed.
-
-
-## v20.3 LIVE TP balance propagation
-
-A freshly matched LIVE BUY can briefly be visible in bot/CLOB execution history before
-the acquired outcome-token balance is available to a subsequent SELL. To avoid a
-false fail-closed TP in that short window:
-
-- the first LIVE TP SELL is delayed by `LIVE_TP_MIN_HOLD_MS` after the newest BUY;
-- explicit `not enough balance / allowance` TAKE_PROFIT rejections are stored as
-  `REJECTED_BALANCE_ALLOWANCE`, not `AMBIGUOUS`;
-- no unknown fill is assumed for that deterministic rejection;
-- the tracked position remains open and TP retries on later cycles with
-  `LIVE_TP_BALANCE_RETRY_DELAY_MS` backoff;
-- unknown timeouts/transport failures after submission still remain AMBIGUOUS and
-  fail-closed.
-
-Defaults:
-
-```text
-LIVE_TP_MIN_HOLD_MS=2000
-LIVE_TP_BALANCE_RETRY_DELAY_MS=1000
-```
-
-At startup v20.3 also repairs old v20.2 `AMBIGUOUS` TP rows whose stored error
-explicitly says `not enough balance`, so an already affected open position can
-resume TP attempts after redeploy.
