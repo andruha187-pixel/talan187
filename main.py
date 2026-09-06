@@ -46,7 +46,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.3-multi7-prejump-live-tp-balance-sync"
+VERSION = "20.4-multi7-prejump-live-entry-diag"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -3074,6 +3074,71 @@ async def execute_paper(condition, variant, asset, outcome, signal_type):
     return True
 
 
+def _prejump_signal_snapshot(condition, variant_name):
+    """Read the already-accepted PRE-JUMP signal for post-execution diagnostics only."""
+    with db() as conn:
+        row = conn.execute(
+            """SELECT signal_ms,symbol,outcome,pm_ask,pm_bid,pm_momentum,ext_score,
+                      same_votes,opposing_votes,fresh_venues,elapsed_sec,threshold
+               FROM prejump_signals
+               WHERE condition_id=? AND variant=?
+               ORDER BY id DESC LIMIT 1""",
+            (condition, variant_name),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+async def _notify_live_entry_not_filled(
+    condition, variant, asset, outcome, reference_price, error, stage="EXECUTION"
+):
+    """Telegram-only post-failure diagnostics. Never runs before an ENTRY attempt."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+
+    name = variant["name"]
+    # AMBIGUOUS and local-validation failures already have dedicated alerts.
+    if live_action_ambiguous(condition, name, "BUY", "ENTRY"):
+        return
+
+    snap = _prejump_signal_snapshot(condition, name)
+    signal_ask = sf(snap.get("pm_ask"), sf(reference_price))
+    current_ask = best_ask(asset)
+    cap = _entry_price_cap(reference_price)
+    score = snap.get("ext_score")
+    mom = snap.get("pm_momentum")
+    votes = snap.get("same_votes")
+    fresh = snap.get("fresh_venues")
+    elapsed = snap.get("elapsed_sec")
+
+    signal_bits = []
+    if score is not None:
+        signal_bits.append(f"score {sf(score):.3f}")
+    if mom is not None:
+        signal_bits.append(f"mom {sf(mom):+.3f}")
+    if votes is not None:
+        signal_bits.append(f"votes {si(votes)}")
+    if fresh is not None:
+        signal_bits.append(f"fresh {si(fresh)}")
+    if elapsed is not None:
+        signal_bits.append(f"t={sf(elapsed):.2f}s")
+
+    price_bits = [f"signal ask {signal_ask:.3f}"]
+    if current_ask is not None:
+        price_bits.append(f"live ask {sf(current_ask):.3f}")
+    if cap is not None:
+        price_bits.append(f"cap {sf(cap):.3f}")
+
+    await tg_send(
+        f"🔎 LIVE ENTRY MISSED {variant['symbol']}\n"
+        f"Signal SEEN: {outcome}"
+        + (" | " + " | ".join(signal_bits) if signal_bits else "")
+        + "\n"
+        + " | ".join(price_bits)
+        + f"\n{stage}: {str(error or 'not_filled')[:500]}\n"
+        + "No position opened. PRE-JUMP ENTRY rules were not changed."
+    )
+
+
 async def execute_order(
     condition, variant, asset, outcome, signal_type, reference_price=None
 ):
@@ -3099,6 +3164,11 @@ async def execute_order(
     # failures remain fail-closed inside execute_live_fak. Revalidate the live
     # PRE-JUMP direction and a fresh book before each allowed retry.
     if not result.get("retryable") or LIVE_ENTRY_NO_MATCH_RETRIES <= 0:
+        if str(result.get("status") or "") != "REJECTED_LOCAL":
+            await _notify_live_entry_not_filled(
+                condition, variant, asset, outcome, reference_price,
+                result.get("error"), stage=str(result.get("status") or "EXECUTION"),
+            )
         return False
 
     last_reason = "no_match"
@@ -3132,12 +3202,11 @@ async def execute_order(
             break
         last_reason = "no_match_again"
 
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        await tg_send(
-            f"⏭ LIVE ENTRY NOT FILLED {variant['symbol']}\n"
-            f"{outcome}: deterministic FAK NO_MATCH; no position opened.\n"
-            f"Retry stopped: {last_reason}. No ambiguous order is left behind."
-        )
+    await _notify_live_entry_not_filled(
+        condition, variant, asset, outcome, reference_price,
+        f"deterministic FAK NO_MATCH; retry stopped: {last_reason}",
+        stage="NO_MATCH_RETRY",
+    )
     return False
 
 

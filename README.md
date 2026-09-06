@@ -203,3 +203,31 @@ LIVE_TP_BALANCE_RETRY_DELAY_MS=1000
 At startup v20.3 also repairs old v20.2 `AMBIGUOUS` TP rows whose stored error
 explicitly says `not enough balance`, so an already affected open position can
 resume TP attempts after redeploy.
+
+
+## v20.4 LIVE ENTRY diagnostics — ENTRY FROZEN
+
+This build does **not** change PRE-JUMP signal thresholds, score calculation,
+entry window, book/slippage guards, FAK submission, retry rules, or TP logic from
+v20.3. It only adds a Telegram diagnostic **after** a LIVE ENTRY attempt has
+already failed.
+
+A failed accepted signal now reports:
+
+```text
+LIVE ENTRY MISSED BTC
+Signal SEEN: Up | score ... | mom ... | votes ... | fresh ... | t=...s
+signal ask ... | live ask ... | cap ...
+EXECUTION: <exact reason>
+```
+
+Interpretation:
+- If the research bot enters and LIVE shows `LIVE ENTRY MISSED`, the PRE-JUMP
+  signal was seen by LIVE and the failure happened during real execution.
+- If the research bot enters but LIVE shows neither `LIVE BUY` nor
+  `LIVE ENTRY MISSED`, LIVE never accepted that PRE-JUMP signal; compare the
+  signal-stage book/momentum feeds.
+
+No additional REST call or Telegram send is performed **before** the LIVE order
+attempt; diagnostics are emitted only after a failed attempt, so they do not add
+latency to successful ENTRY execution.
