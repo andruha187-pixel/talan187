@@ -164,3 +164,15 @@ LIVE_ENTRY_FORCE_REST_BOOK=1
 The slippage cap is also bounded by `PREJUMP_PRICE_MAX`, so an accepted signal
 at 0.66 cannot be chased above 0.66.
 
+
+
+## v20.2 tick-safe LIVE price
+
+LIVE limit prices are aligned to the Polymarket outcome token tick before signing.
+The bot preserves `tick_size` from fresh order-book snapshots when available and
+uses `LIVE_PRICE_TICK_FALLBACK=0.01` otherwise. BUY limits are rounded DOWN to
+the tick so normalization never exceeds the configured slippage cap.
+
+Errors raised while building/signing the order, before any `post_order` call, are
+recorded as `REJECTED_LOCAL` and are not treated as ambiguous submissions.
+Unknown failures after submission remain fail-closed.

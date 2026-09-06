@@ -10,7 +10,7 @@ import asyncio
 import logging
 import statistics
 from dataclasses import replace
-from decimal import Decimal
+from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict, deque
@@ -46,7 +46,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.1-multi7-prejump-live-nomatch-retry"
+VERSION = "20.2-multi7-prejump-live-tick-safe"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -160,6 +160,7 @@ LIVE_ENTRY_RETRY_DELAY_MS = max(0, min(1000, int(os.getenv("LIVE_ENTRY_RETRY_DEL
 LIVE_ENTRY_FORCE_REST_BOOK = os.getenv(
     "LIVE_ENTRY_FORCE_REST_BOOK", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
+LIVE_PRICE_TICK_FALLBACK = max(0.0001, float(os.getenv("LIVE_PRICE_TICK_FALLBACK", "0.01")))
 
 # External public feeds — exact scoring family used by the PRE-JUMP lab.
 ENABLE_BINANCE = os.getenv("ENABLE_BINANCE", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -894,12 +895,23 @@ async def _refresh_entry_book_if_needed(asset):
 
 
 def apply_book(asset, payload, source="ws"):
-
+    # Polymarket book snapshots can include the market tick size. Preserve it so
+    # signed LIVE order prices are always aligned to the token's actual increment.
+    prior = books.get(asset) or {}
+    tick_raw = (
+        payload.get("tick_size")
+        if isinstance(payload, dict) and payload.get("tick_size") is not None
+        else payload.get("tickSize") if isinstance(payload, dict) else None
+    )
+    tick = sf(tick_raw, sf(prior.get("tick_size"), LIVE_PRICE_TICK_FALLBACK))
+    if tick <= 0:
+        tick = LIVE_PRICE_TICK_FALLBACK
     books[asset] = {
         "bids": level_map(payload.get("bids")),
         "asks": level_map(payload.get("asks")),
         "received_ms": now_ms(),
         "source": source,
+        "tick_size": tick,
     }
 
 
@@ -2503,6 +2515,32 @@ def _entry_price_cap(reference_ask):
     return min(PREJUMP_PRICE_MAX, sf(reference_ask) + LIVE_ENTRY_MAX_SLIPPAGE)
 
 
+def _asset_tick_size(asset):
+    """Return a positive Decimal tick size for a Polymarket outcome token."""
+    b = books.get(asset) or {}
+    raw = sf(b.get("tick_size"), LIVE_PRICE_TICK_FALLBACK)
+    if raw <= 0:
+        raw = LIVE_PRICE_TICK_FALLBACK
+    return Decimal(str(raw))
+
+
+def _normalize_live_limit_price(asset, price, side):
+    """Align an order limit to the token tick without violating the price guard.
+
+    BUY is floored so normalization can never exceed the configured slippage cap.
+    SELL is ceiled so normalization can never sell below the intended minimum.
+    """
+    tick = _asset_tick_size(asset)
+    px = Decimal(str(price))
+    if tick <= 0:
+        tick = Decimal(str(LIVE_PRICE_TICK_FALLBACK))
+    rounding = ROUND_FLOOR if str(side).upper() == "BUY" else ROUND_CEILING
+    units = (px / tick).to_integral_value(rounding=rounding)
+    normalized = units * tick
+    # normalize() can produce exponent notation; the caller formats with 'f'.
+    return normalized.normalize()
+
+
 async def _live_entry_retry_valid(condition, variant, asset, outcome, reference_ask):
     """Revalidate a deterministic NO_MATCH before one optional fast retry.
 
@@ -2615,12 +2653,17 @@ async def execute_live_fak(
             if limit_price is None or visible <= 1e-9:
                 return {"ok": False, "filled": 0.0, "error": "no_visible_liquidity"}
 
-        # Book prices are already valid Polymarket ticks. Decimal(str(...)) avoids
-        # adding binary-float noise to the signed price.
-        limit_str = format(Decimal(str(limit_price)), "f")
+        # Align the price to the actual Polymarket token tick. This is critical
+        # when reference_price + slippage creates e.g. 0.645 while tick_size=0.01.
+        # BUY rounds DOWN, so this can never exceed the configured slippage cap.
+        normalized_limit = _normalize_live_limit_price(asset, limit_price, action)
+        limit_price = float(normalized_limit)
+        limit_str = format(normalized_limit, "f")
         size_str = format(Decimal(str(wanted)), "f")
         submitted = now_ms()
 
+        # Stage 1: build/sign locally. Any exception here is definitely BEFORE
+        # submission, therefore it is safe and must never be marked AMBIGUOUS.
         try:
             signed = await live_client.create_limit_order(
                 token_id=str(asset),
@@ -2629,8 +2672,42 @@ async def execute_live_fak(
                 side=action,
                 post_only=False,
             )
-            # SignedOrder is a frozen dataclass and supports order_type FAK.
             fak_order = replace(signed, order_type="FAK", post_only=False)
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            with db() as conn:
+                conn.execute("""
+                    INSERT INTO live_orders(
+                        submitted_ms,condition_id,variant,symbol,asset,outcome,action,reason,
+                        requested_shares,limit_price,order_id,status,filled_shares,avg_price,
+                        gross_amount,fee_estimate,net_or_total,trade_ids_json,response_json,error
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    submitted, condition, name, symbol, asset, outcome, action, reason,
+                    wanted, limit_price, "", "REJECTED_LOCAL", 0.0, None,
+                    0.0, 0.0, 0.0, "[]", "{}", error,
+                ))
+                conn.commit()
+            log.warning(
+                "LIVE LOCAL REJECT %s | %s %s %s %.4fsh limit=%s tick=%s | %s",
+                name, action, reason, outcome, wanted, limit_str,
+                format(_asset_tick_size(asset), "f"), error,
+            )
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                await tg_send(
+                    f"⛔ LIVE ORDER REJECTED {symbol}\n"
+                    f"{action} {reason}: {error}\n"
+                    f"limit={limit_str} | tick={format(_asset_tick_size(asset), 'f')}\n"
+                    "Order was rejected before submission; no real order was created."
+                )
+            return {
+                "ok": False, "filled": 0.0, "error": error,
+                "retryable": False, "status": "REJECTED_LOCAL",
+            }
+
+        # Stage 2: from this point onward a submission may occur. Unknown transport
+        # failures stay fail-closed; only deterministic FAK NO_MATCH is retry-safe.
+        try:
             if sdk_post_order_with_allowance_recovery is not None:
                 response = await sdk_post_order_with_allowance_recovery(live_client, fak_order)
             else:
