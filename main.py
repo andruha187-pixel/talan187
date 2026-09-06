@@ -46,7 +46,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.0-multi7-prejump-paper-live-score"
+VERSION = "20.1-multi7-prejump-live-nomatch-retry"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -149,6 +149,17 @@ POLYMARKET_RELAYER_API_KEY = os.getenv("POLYMARKET_RELAYER_API_KEY", "").strip()
 POLYMARKET_RELAYER_API_KEY_ADDRESS = os.getenv("POLYMARKET_RELAYER_API_KEY_ADDRESS", "").strip()
 LIVE_MAX_SHARES_PER_ORDER = float(os.getenv("LIVE_MAX_SHARES_PER_ORDER", "1000"))
 LIVE_MIN_SHARES = float(os.getenv("LIVE_MIN_SHARES", "0.01"))
+
+# LIVE ENTRY execution tolerance. PRE-JUMP moves fast, so the visible ask can
+# disappear between signal evaluation and FAK submission. We force a fresh REST
+# book immediately before BUY, allow only this much price movement from the
+# original signal ask, and retry only deterministic zero-fill FAK NO_MATCH.
+LIVE_ENTRY_MAX_SLIPPAGE = max(0.0, float(os.getenv("LIVE_ENTRY_MAX_SLIPPAGE", "0.01")))
+LIVE_ENTRY_NO_MATCH_RETRIES = max(0, min(2, int(os.getenv("LIVE_ENTRY_NO_MATCH_RETRIES", "1"))))
+LIVE_ENTRY_RETRY_DELAY_MS = max(0, min(1000, int(os.getenv("LIVE_ENTRY_RETRY_DELAY_MS", "150"))))
+LIVE_ENTRY_FORCE_REST_BOOK = os.getenv(
+    "LIVE_ENTRY_FORCE_REST_BOOK", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 
 # External public feeds — exact scoring family used by the PRE-JUMP lab.
 ENABLE_BINANCE = os.getenv("ENABLE_BINANCE", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -2452,12 +2463,11 @@ def live_action_ambiguous(condition, variant_name, action, reason):
         ).fetchone())
 
 
-def _visible_fak_limit(asset, wanted, side):
-    """Worst visible price needed for up to `wanted` shares.
+def _visible_fak_limit(asset, wanted, side, max_buy_price=None, min_sell_price=None):
+    """Worst visible price needed for up to `wanted` shares, optionally capped.
 
-    This keeps LIVE execution close to the PAPER book walk: the FAK order can
-    take liquidity at this price or better, but cannot chase beyond the
-    snapshot used by PAPER.
+    BUY can be capped by max_buy_price so a fast PRE-JUMP order never chases
+    beyond the configured slippage budget. SELL keeps the previous behaviour.
     """
     b = books.get(asset) or {}
     side = str(side).upper()
@@ -2470,10 +2480,15 @@ def _visible_fak_limit(asset, wanted, side):
     worst = None
     prices = sorted(levels) if side == "BUY" else sorted(levels, reverse=True)
     for px in prices:
+        px_f = sf(px)
+        if side == "BUY" and max_buy_price is not None and px_f > sf(max_buy_price) + 1e-12:
+            break
+        if side == "SELL" and min_sell_price is not None and px_f < sf(min_sell_price) - 1e-12:
+            break
         q = max(0.0, sf(levels[px]))
         take = min(q, remaining)
         if take > 0:
-            worst = sf(px)
+            worst = px_f
             filled_visible += take
             remaining -= take
         if remaining <= 1e-9:
@@ -2481,11 +2496,63 @@ def _visible_fak_limit(asset, wanted, side):
     return worst, filled_visible
 
 
-async def execute_live_fak(condition, variant, asset, outcome, reason, action, wanted):
-    """Place an exact-share IOC/FAK order using the current visible book.
+def _entry_price_cap(reference_ask):
+    """Maximum LIVE BUY price allowed from the original accepted signal ask."""
+    if reference_ask is None:
+        return None
+    return min(PREJUMP_PRICE_MAX, sf(reference_ask) + LIVE_ENTRY_MAX_SLIPPAGE)
 
-    BUY: exact maximum share size via a signed LIMIT order converted to FAK.
-    SELL: same for the stop liquidation.
+
+async def _live_entry_retry_valid(condition, variant, asset, outcome, reference_ask):
+    """Revalidate a deterministic NO_MATCH before one optional fast retry.
+
+    The retry is allowed only while the same PRE-JUMP direction is still strong,
+    the market is still inside its entry time window, and a fresh REST ask is
+    within both the strategy price band and the original signal slippage cap.
+    """
+    market = markets.get(condition)
+    if not market:
+        return False, "market_missing"
+
+    elapsed = time.time() - sf(market.get("start_ts"))
+    if not (PREJUMP_MIN_ELAPSED <= elapsed <= PREJUMP_MAX_ELAPSED):
+        return False, "outside_entry_window"
+
+    feature = latest_feature(variant["symbol"])
+    if not feature or si(feature.get("fresh_venues")) < PREJUMP_MIN_VENUES:
+        return False, "external_sources_not_fresh"
+
+    ext_score = sf(feature.get("ext_score"))
+    current_outcome = "Up" if ext_score > 0 else "Down"
+    if current_outcome != outcome:
+        return False, "direction_changed"
+
+    directional = directional_external(feature, outcome)
+    threshold = prejump_score()
+    if directional["score"] + 1e-12 < threshold:
+        return False, "score_faded"
+    if directional["same_votes"] < PREJUMP_MIN_VENUES:
+        return False, "venue_votes_faded"
+    if PREJUMP_REQUIRE_BINANCE_BYBIT and not (
+        directional["binance_same"] and directional["bybit_same"]
+    ):
+        return False, "binance_bybit_confirmation_faded"
+
+    # Price/book validity is checked again inside execute_live_fak immediately
+    # before submission using a forced REST snapshot. Avoid doing two sequential
+    # REST calls here because PRE-JUMP latency matters.
+    return True, "ok"
+
+
+async def execute_live_fak(
+    condition, variant, asset, outcome, reason, action, wanted,
+    reference_price=None, force_rest=False,
+):
+    """Place an exact-share FAK order using a freshly checked visible book.
+
+    PRE-JUMP BUY may use reference_price + LIVE_ENTRY_MAX_SLIPPAGE as a hard
+    ceiling. Deterministic FAK NO_MATCH is returned as retry-safe; transport or
+    unknown submission failures remain fail-closed/AMBIGUOUS.
     """
     name = variant["name"]
     symbol = variant["symbol"]
@@ -2511,11 +2578,42 @@ async def execute_live_fak(condition, variant, asset, outcome, reason, action, w
             log.error("LIVE FAIL-CLOSED %s %s %s: previous submission is ambiguous", name, action, reason)
             return {"ok": False, "filled": 0.0, "error": "previous_submission_ambiguous"}
 
-        await ensure_book(asset)
+        # For PRE-JUMP BUY, force a REST snapshot immediately before submission
+        # by default. This closes most of the WS->submission race that caused
+        # deterministic FAK NO_MATCH on fast jumps.
+        if action == "BUY" and reason == "ENTRY" and (force_rest or LIVE_ENTRY_FORCE_REST_BOOK):
+            await refresh_book(asset)
+        else:
+            await ensure_book(asset)
 
-        limit_price, visible = _visible_fak_limit(asset, wanted, action)
-        if limit_price is None or visible <= 1e-9:
-            return {"ok": False, "filled": 0.0, "error": "no_visible_liquidity"}
+        if action == "BUY" and reason == "ENTRY":
+            best_now = best_ask(asset)
+            cap = _entry_price_cap(reference_price)
+            if best_now is None:
+                return {"ok": False, "filled": 0.0, "error": "no_visible_liquidity"}
+            if best_now < PREJUMP_PRICE_MIN - 1e-12 or best_now > PREJUMP_PRICE_MAX + 1e-12:
+                return {
+                    "ok": False, "filled": 0.0,
+                    "error": f"entry_price_outside_band:{best_now:.4f}",
+                }
+            if cap is not None and best_now > cap + 1e-12:
+                return {
+                    "ok": False, "filled": 0.0,
+                    "error": f"entry_price_beyond_slippage:{best_now:.4f}>{cap:.4f}",
+                }
+            _worst, visible = _visible_fak_limit(
+                asset, wanted, action, max_buy_price=cap
+            )
+            if visible <= 1e-9:
+                return {"ok": False, "filled": 0.0, "error": "no_visible_liquidity_within_slippage"}
+            # When a PRE-JUMP reference price is supplied, submit at its hard
+            # slippage cap so one fast tick can still match. Direct/internal BUY
+            # calls without a reference retain the previous visible-worst limit.
+            limit_price = cap if cap is not None else _worst
+        else:
+            limit_price, visible = _visible_fak_limit(asset, wanted, action)
+            if limit_price is None or visible <= 1e-9:
+                return {"ok": False, "filled": 0.0, "error": "no_visible_liquidity"}
 
         # Book prices are already valid Polymarket ticks. Decimal(str(...)) avoids
         # adding binary-float noise to the signed price.
@@ -2543,6 +2641,8 @@ async def execute_live_fak(condition, variant, asset, outcome, reason, action, w
             ok = bool(getattr(response, "ok", False))
             if not ok:
                 error = f"{getattr(response, 'code', 'rejected')}: {getattr(response, 'message', '')}".strip()
+                no_match = is_definite_fak_no_match_error(error)
+                reject_status = "REJECTED_NO_MATCH" if no_match else "REJECTED"
                 with db() as conn:
                     conn.execute("""
                         INSERT INTO live_orders(
@@ -2552,12 +2652,15 @@ async def execute_live_fak(condition, variant, asset, outcome, reason, action, w
                         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """, (
                         submitted, condition, name, symbol, asset, outcome, action, reason,
-                        wanted, limit_price, "", "REJECTED", 0.0, None, 0.0, 0.0, 0.0,
+                        wanted, limit_price, "", reject_status, 0.0, None, 0.0, 0.0, 0.0,
                         "[]", _response_json(response), error,
                     ))
                     conn.commit()
                 log.warning("LIVE REJECT %s %s %s | %s", name, action, reason, error)
-                return {"ok": False, "filled": 0.0, "error": error}
+                return {
+                    "ok": False, "filled": 0.0, "error": error,
+                    "retryable": bool(no_match), "status": reject_status,
+                }
 
             making = sf(getattr(response, "making_amount", 0))
             taking = sf(getattr(response, "taking_amount", 0))
@@ -2638,25 +2741,20 @@ async def execute_live_fak(condition, variant, asset, outcome, reason, action, w
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
 
-            # IMPORTANT: a FAK "no orders found to match" rejection is not
-            # ambiguous. It is a deterministic zero-fill/kill. For TAKE_PROFIT
-            # SELL only, record it as retry-safe instead of poisoning the
-            # market/action with AMBIGUOUS. maybe_take_profit() will re-check
-            # the current NET TP condition on the next ~3s cycle and submit a
-            # fresh SELL only while that condition is still true.
-            retryable_tp_no_match = (
-                action == "SELL"
-                and reason == "TAKE_PROFIT"
-                and is_definite_fak_no_match_error(e)
-            )
+            # IMPORTANT: a FAK "no orders found to match" rejection is a
+            # deterministic zero-fill/kill, not an ambiguous submission. Record
+            # it as REJECTED_NO_MATCH for both ENTRY BUY and TAKE_PROFIT SELL.
+            # BUY may receive one tightly controlled immediate retry in
+            # execute_order(); SELL TP keeps its existing later-cycle retry.
+            retryable_no_match = is_definite_fak_no_match_error(e)
 
-            if retryable_tp_no_match:
+            if retryable_no_match:
                 with db() as conn:
                     prior = si(conn.execute(
                         """SELECT COUNT(*) c FROM live_orders
-                           WHERE condition_id=? AND variant=? AND action='SELL'
-                             AND reason='TAKE_PROFIT' AND status='REJECTED_NO_MATCH'""",
-                        (condition, name),
+                           WHERE condition_id=? AND variant=? AND action=?
+                             AND reason=? AND status='REJECTED_NO_MATCH'""",
+                        (condition, name, action, reason),
                     ).fetchone()["c"])
                     conn.execute("""
                         INSERT INTO live_orders(
@@ -2672,16 +2770,18 @@ async def execute_live_fak(condition, variant, asset, outcome, reason, action, w
                     conn.commit()
 
                 log.warning(
-                    "LIVE TP NO-MATCH %s | %s %.4fsh limit=%.4f | retry-safe; "
-                    "will retry only while NET TP condition remains true",
-                    name, outcome, wanted, limit_price,
+                    "LIVE FAK NO-MATCH %s | %s %s %s %.4fsh limit=%.4f | retry-safe",
+                    name, action, reason, outcome, wanted, limit_price,
                 )
-                if prior == 0 and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                if (
+                    action == "SELL" and reason == "TAKE_PROFIT"
+                    and prior == 0 and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID
+                ):
                     await tg_send(
                         f"⏳ LIVE TP NO MATCH {symbol} / {variant['code']}\n"
                         f"SELL TAKE_PROFIT {outcome}: 0sh filled.\n"
                         "FAK was killed with no match, so this is NOT treated as ambiguous.\n"
-                        "Bot will retry on later ~3s cycles only while the current NET TP "
+                        "Bot will retry on later TP cycles only while the current NET TP "
                         "condition is still satisfied."
                     )
                 return {
@@ -2783,7 +2883,9 @@ async def execute_paper(condition, variant, asset, outcome, signal_type):
     return True
 
 
-async def execute_order(condition, variant, asset, outcome, signal_type):
+async def execute_order(
+    condition, variant, asset, outcome, signal_type, reference_price=None
+):
     pos_before = position_totals(condition, variant["name"])
     if pos_before["buys"] and pos_before["remaining"] <= 1e-8:
         return False
@@ -2793,11 +2895,59 @@ async def execute_order(condition, variant, asset, outcome, signal_type):
         return False
     if mode == "PAPER":
         return await execute_paper(condition, variant, asset, outcome, signal_type)
+
     wanted = requested_shares(variant, signal_type)
     result = await execute_live_fak(
-        condition, variant, asset, outcome, signal_type, "BUY", wanted
+        condition, variant, asset, outcome, signal_type, "BUY", wanted,
+        reference_price=reference_price, force_rest=True,
     )
-    return sf(result.get("filled")) > 1e-9
+    if sf(result.get("filled")) > 1e-9:
+        return True
+
+    # Retry ONLY deterministic zero-fill FAK NO_MATCH. Unknown/network/API
+    # failures remain fail-closed inside execute_live_fak. Revalidate the live
+    # PRE-JUMP direction and a fresh book before each allowed retry.
+    if not result.get("retryable") or LIVE_ENTRY_NO_MATCH_RETRIES <= 0:
+        return False
+
+    last_reason = "no_match"
+    for attempt in range(1, LIVE_ENTRY_NO_MATCH_RETRIES + 1):
+        if LIVE_ENTRY_RETRY_DELAY_MS:
+            await asyncio.sleep(LIVE_ENTRY_RETRY_DELAY_MS / 1000.0)
+        valid, last_reason = await _live_entry_retry_valid(
+            condition, variant, asset, outcome, reference_price
+        )
+        if not valid:
+            log.warning(
+                "LIVE ENTRY RETRY CANCEL %s %s | attempt=%d | %s",
+                variant["name"], outcome, attempt, last_reason,
+            )
+            break
+
+        retry = await execute_live_fak(
+            condition, variant, asset, outcome, signal_type, "BUY", wanted,
+            reference_price=reference_price, force_rest=True,
+        )
+        if sf(retry.get("filled")) > 1e-9:
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                await tg_send(
+                    f"✅ LIVE ENTRY RETRY FILLED {variant['symbol']}\n"
+                    f"{outcome}: {sf(retry.get('filled')):.4f}sh @ "
+                    f"{sf(retry.get('avg')):.4f} | retry {attempt}/{LIVE_ENTRY_NO_MATCH_RETRIES}"
+                )
+            return True
+        if not retry.get("retryable"):
+            last_reason = str(retry.get("error") or "retry_not_safe")
+            break
+        last_reason = "no_match_again"
+
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        await tg_send(
+            f"⏭ LIVE ENTRY NOT FILLED {variant['symbol']}\n"
+            f"{outcome}: deterministic FAK NO_MATCH; no position opened.\n"
+            f"Retry stopped: {last_reason}. No ambiguous order is left behind."
+        )
+    return False
 
 
 def pm_fast_momentum(condition, asset, seconds=1.0):
@@ -2890,7 +3040,9 @@ async def evaluate_prejump_variant(market, variant, elapsed, feature):
         f"{bid:.3f}" if bid is not None else "n/a", mom,
         directional["score"], threshold, directional["same_votes"], elapsed,
     )
-    filled = await execute_order(cid, variant, asset, outcome, "ENTRY")
+    filled = await execute_order(
+        cid, variant, asset, outcome, "ENTRY", reference_price=ask
+    )
     if not filled:
         log.warning(
             "PREJUMP NO FILL %-4s %s | gate remains closed for this market (duplicate-safe)",

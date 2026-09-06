@@ -135,3 +135,32 @@ python test_prejump_live.py
 ```text
 PRE-JUMP PAPER/LIVE regression: OK
 ```
+
+## LIVE FAK NO_MATCH handling (v20.1)
+
+PRE-JUMP can move faster than the Polymarket book snapshot. A deterministic
+`no orders found to match with FAK order` response is now stored as
+`REJECTED_NO_MATCH`, **not** `AMBIGUOUS`. It represents a zero-fill killed FAK.
+
+For LIVE ENTRY the bot now:
+
+1. forces a fresh REST book immediately before submission;
+2. uses the accepted signal ask plus `LIVE_ENTRY_MAX_SLIPPAGE` as a hard BUY cap;
+3. on deterministic NO_MATCH only, waits `LIVE_ENTRY_RETRY_DELAY_MS`;
+4. rechecks PRE-JUMP direction/score/venue votes and performs at most
+   `LIVE_ENTRY_NO_MATCH_RETRIES` additional attempt(s);
+5. never retries timeouts, transport failures or unknown submission errors. Those
+   remain `AMBIGUOUS` and fail-closed.
+
+Defaults:
+
+```text
+LIVE_ENTRY_MAX_SLIPPAGE=0.01
+LIVE_ENTRY_NO_MATCH_RETRIES=1
+LIVE_ENTRY_RETRY_DELAY_MS=150
+LIVE_ENTRY_FORCE_REST_BOOK=1
+```
+
+The slippage cap is also bounded by `PREJUMP_PRICE_MAX`, so an accepted signal
+at 0.66 cannot be chased above 0.66.
+
