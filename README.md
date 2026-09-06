@@ -158,7 +158,7 @@ Defaults:
 LIVE_ENTRY_MAX_SLIPPAGE=0.01
 LIVE_ENTRY_NO_MATCH_RETRIES=1
 LIVE_ENTRY_RETRY_DELAY_MS=150
-LIVE_ENTRY_FORCE_REST_BOOK=1
+LIVE_ENTRY_FORCE_REST_BOOK=0
 ```
 
 The slippage cap is also bounded by `PREJUMP_PRICE_MAX`, so an accepted signal
@@ -231,3 +231,33 @@ Interpretation:
 No additional REST call or Telegram send is performed **before** the LIVE order
 attempt; diagnostics are emitted only after a failed attempt, so they do not add
 latency to successful ENTRY execution.
+
+
+## v20.5 low-latency first LIVE ENTRY
+
+PRE-JUMP signal rules and thresholds are unchanged. The execution path after an
+already-accepted LIVE signal is faster:
+
+- `FAST_INTERVAL` default is now `0.10` seconds.
+- The first LIVE PRE-JUMP FAK no longer performs a mandatory REST book refresh.
+- It immediately uses the current fresh WebSocket book and the existing hard
+  `LIVE_ENTRY_MAX_SLIPPAGE` cap.
+- If the WS book is stale/missing/crossed, the existing book-safety logic can
+  refresh it before execution.
+- A deterministic FAK `NO_MATCH` retry still uses a fresh REST snapshot and
+  revalidates direction/score/votes before retrying.
+- Unknown post-submission failures remain fail-closed.
+
+Recommended execution env for this build:
+
+```text
+FAST_INTERVAL=0.10
+LIVE_ENTRY_MAX_SLIPPAGE=0.03
+LIVE_ENTRY_NO_MATCH_RETRIES=1
+LIVE_ENTRY_RETRY_DELAY_MS=150
+LIVE_ENTRY_FORCE_REST_BOOK=0
+```
+
+`LIVE_ENTRY_FORCE_REST_BOOK` is retained only for configuration compatibility;
+v20.5 does not allow an old value of `1` to force a REST round-trip on the first
+accepted PRE-JUMP BUY.

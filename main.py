@@ -46,7 +46,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.4-multi7-prejump-live-entry-diag"
+VERSION = "20.5-multi7-prejump-live-lowlatency"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -77,7 +77,7 @@ SYMBOLS = _configured_symbols()
 TRADE_SYMBOLS = list(SYMBOLS)
 
 # PRE-JUMP decision cadence / Polymarket filters.
-FAST_INTERVAL = max(0.10, float(os.getenv("FAST_INTERVAL", "0.25")))
+FAST_INTERVAL = max(0.10, float(os.getenv("FAST_INTERVAL", "0.10")))
 DECISION_INTERVAL = FAST_INTERVAL  # compatibility with older helper messages
 TRADE_WINDOW_SECONDS = float(os.getenv("PREJUMP_MAX_ELAPSED", "160"))
 SOURCE_FRESH_MS = int(os.getenv("SOURCE_FRESH_MS", "2500"))
@@ -154,12 +154,13 @@ LIVE_MIN_SHARES = float(os.getenv("LIVE_MIN_SHARES", "0.01"))
 # disappear between signal evaluation and FAK submission. We force a fresh REST
 # book immediately before BUY, allow only this much price movement from the
 # original signal ask, and retry only deterministic zero-fill FAK NO_MATCH.
-LIVE_ENTRY_MAX_SLIPPAGE = max(0.0, float(os.getenv("LIVE_ENTRY_MAX_SLIPPAGE", "0.01")))
+LIVE_ENTRY_MAX_SLIPPAGE = max(0.0, float(os.getenv("LIVE_ENTRY_MAX_SLIPPAGE", "0.03")))
 LIVE_ENTRY_NO_MATCH_RETRIES = max(0, min(2, int(os.getenv("LIVE_ENTRY_NO_MATCH_RETRIES", "1"))))
 LIVE_ENTRY_RETRY_DELAY_MS = max(0, min(1000, int(os.getenv("LIVE_ENTRY_RETRY_DELAY_MS", "150"))))
-LIVE_ENTRY_FORCE_REST_BOOK = os.getenv(
-    "LIVE_ENTRY_FORCE_REST_BOOK", "1"
-).strip().lower() in {"1", "true", "yes", "on"}
+# Legacy compatibility only. v20.5 deliberately does NOT force a REST round-trip
+# before the first PRE-JUMP FAK. A fresh WS book is used immediately; REST is
+# only used if the book is stale/missing/crossed, or on the controlled NO_MATCH retry.
+LIVE_ENTRY_FORCE_REST_BOOK = False
 LIVE_PRICE_TICK_FALLBACK = max(0.0001, float(os.getenv("LIVE_PRICE_TICK_FALLBACK", "0.01")))
 
 # LIVE TP settlement/CTF balance propagation guard. A successful BUY can be
@@ -2695,10 +2696,12 @@ async def execute_live_fak(
             log.error("LIVE FAIL-CLOSED %s %s %s: previous submission is ambiguous", name, action, reason)
             return {"ok": False, "filled": 0.0, "error": "previous_submission_ambiguous"}
 
-        # For PRE-JUMP BUY, force a REST snapshot immediately before submission
-        # by default. This closes most of the WS->submission race that caused
-        # deterministic FAK NO_MATCH on fast jumps.
-        if action == "BUY" and reason == "ENTRY" and (force_rest or LIVE_ENTRY_FORCE_REST_BOOK):
+        # LOW-LATENCY PRE-JUMP execution:
+        # - first BUY uses the already-fresh WS book immediately; no mandatory REST RTT;
+        # - if the book is stale/missing, ensure_book() refreshes it;
+        # - controlled NO_MATCH retry may explicitly pass force_rest=True.
+        # The hard limit-price/slippage cap below still prevents chasing the market.
+        if action == "BUY" and reason == "ENTRY" and force_rest:
             await refresh_book(asset)
         else:
             await ensure_book(asset)
@@ -3155,14 +3158,14 @@ async def execute_order(
     wanted = requested_shares(variant, signal_type)
     result = await execute_live_fak(
         condition, variant, asset, outcome, signal_type, "BUY", wanted,
-        reference_price=reference_price, force_rest=True,
+        reference_price=reference_price, force_rest=False,
     )
     if sf(result.get("filled")) > 1e-9:
         return True
 
     # Retry ONLY deterministic zero-fill FAK NO_MATCH. Unknown/network/API
-    # failures remain fail-closed inside execute_live_fak. Revalidate the live
-    # PRE-JUMP direction and a fresh book before each allowed retry.
+    # failures remain fail-closed inside execute_live_fak. The retry revalidates
+    # direction and then deliberately uses a fresh REST book.
     if not result.get("retryable") or LIVE_ENTRY_NO_MATCH_RETRIES <= 0:
         if str(result.get("status") or "") != "REJECTED_LOCAL":
             await _notify_live_entry_not_filled(
