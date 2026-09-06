@@ -46,7 +46,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.2-multi7-prejump-live-tick-safe"
+VERSION = "20.3-multi7-prejump-live-tp-balance-sync"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -161,6 +161,15 @@ LIVE_ENTRY_FORCE_REST_BOOK = os.getenv(
     "LIVE_ENTRY_FORCE_REST_BOOK", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
 LIVE_PRICE_TICK_FALLBACK = max(0.0001, float(os.getenv("LIVE_PRICE_TICK_FALLBACK", "0.01")))
+
+# LIVE TP settlement/CTF balance propagation guard. A successful BUY can be
+# acknowledged by the matching engine slightly before the newly acquired outcome
+# shares become available to a subsequent SELL. Do not fire TP immediately after
+# a fill; if CLOB deterministically rejects a TP SELL for balance/allowance, keep
+# the position tracked and retry on later TP cycles instead of poisoning it as
+# AMBIGUOUS.
+LIVE_TP_MIN_HOLD_MS = max(0, min(10000, int(os.getenv("LIVE_TP_MIN_HOLD_MS", "2000"))))
+LIVE_TP_BALANCE_RETRY_DELAY_MS = max(250, min(10000, int(os.getenv("LIVE_TP_BALANCE_RETRY_DELAY_MS", "1000"))))
 
 # External public feeds — exact scoring family used by the PRE-JUMP lab.
 ENABLE_BINANCE = os.getenv("ENABLE_BINANCE", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -611,7 +620,25 @@ def init_db():
         for key, value in defaults.items():
             if conn.execute("SELECT 1 FROM state WHERE key=?", (key,)).fetchone() is None:
                 conn.execute("INSERT INTO state(key,value) VALUES(?,?)", (key, value))
+
+        # v20.3 migration: older builds incorrectly marked an explicit CLOB
+        # TAKE_PROFIT balance/allowance rejection as AMBIGUOUS. Such a rejection
+        # means the SELL was not accepted, so it is safe to unpoison the action
+        # and let the new balance-propagation retry logic continue. This also
+        # repairs positions already affected before the upgrade.
+        repaired = conn.execute("""
+            UPDATE live_orders
+               SET status='REJECTED_BALANCE_ALLOWANCE'
+             WHERE action='SELL' AND reason='TAKE_PROFIT'
+               AND status IN ('AMBIGUOUS','DELAYED_AMBIGUOUS')
+               AND (
+                    lower(COALESCE(error,'')) LIKE '%not enough balance%'
+                 OR lower(COALESCE(error,'')) LIKE '%insufficient balance%'
+               )
+        """).rowcount
         conn.commit()
+        if repaired:
+            log.warning("v20.3 repaired %d old TP balance rejection(s) from AMBIGUOUS", repaired)
 
     load_take_profit_usdc()
     load_prejump_score()
@@ -768,6 +795,8 @@ live_client = None
 live_client_ready = False
 live_client_error = ""
 live_order_locks = defaultdict(asyncio.Lock)
+live_tp_retry_after_ms = defaultdict(int)
+live_tp_balance_reject_count = defaultdict(int)
 
 
 async def init_live_client():
@@ -2420,6 +2449,20 @@ async def maybe_take_profit(market, variant, elapsed):
     outcome = pos["primary_outcome"] or (
         "Up" if pos["primary_asset"] == str(market["up_asset"]) else "Down"
     )
+
+    # A BUY can be reported matched before the newly acquired conditional-token
+    # balance is visible to a SELL. Give it a short propagation window. This only
+    # delays LIVE TP; PAPER behavior is unchanged.
+    live_buy_ms = [si(x.get("_ms")) for x in pos["buys"] if str(x.get("mode", "")).upper() == "LIVE"]
+    if live_buy_ms:
+        age_since_buy = now_ms() - max(live_buy_ms)
+        if age_since_buy < LIVE_TP_MIN_HOLD_MS:
+            return False
+
+    retry_key = (cid, name, "TAKE_PROFIT")
+    if now_ms() < si(live_tp_retry_after_ms.get(retry_key)):
+        return False
+
     result = await execute_live_fak(
         cid, variant, pos["primary_asset"], outcome,
         "TAKE_PROFIT", "SELL", remaining,
@@ -2427,7 +2470,25 @@ async def maybe_take_profit(market, variant, elapsed):
 
     filled = sf(result.get("filled"))
     if filled <= 1e-9:
+        if result.get("status") == "REJECTED_BALANCE_ALLOWANCE":
+            live_tp_balance_reject_count[retry_key] += 1
+            live_tp_retry_after_ms[retry_key] = now_ms() + LIVE_TP_BALANCE_RETRY_DELAY_MS
+            count = live_tp_balance_reject_count[retry_key]
+            # One Telegram message is enough; subsequent retries stay quiet but
+            # remain visible in logs/SQLite.
+            if count == 1 and TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                await tg_send(
+                    f"⏳ LIVE TP WAITING FOR BALANCE {variant['symbol']} {variant['code']}\n"
+                    f"Bought shares are tracked, but CLOB has not exposed enough "
+                    f"outcome-token balance/allowance for SELL yet.\n"
+                    f"Retrying every ~{LIVE_TP_BALANCE_RETRY_DELAY_MS/1000:.2f}s; "
+                    "this rejection is NOT ambiguous and does not block TP."
+                )
         return False
+
+    # Any successful SELL clears temporary balance-sync backoff state.
+    live_tp_retry_after_ms.pop(retry_key, None)
+    live_tp_balance_reject_count.pop(retry_key, None)
 
     after = position_totals(cid, name)
     if after["remaining"] <= 1e-8:
@@ -2461,6 +2522,24 @@ def is_definite_fak_no_match_error(exc):
     return (
         "no orders found to match with fak order" in text
         and "fak" in text
+    )
+
+
+def is_definite_balance_allowance_rejection(exc):
+    """True for an explicit CLOB rejection before a SELL is accepted.
+
+    Typical message after a just-matched BUY:
+      RequestRejectedError: not enough balance / allowance: ... balance: 0 ...
+
+    This is not ambiguous: CLOB rejected the order, so there is no unknown SELL
+    fill to duplicate. The common short-lived case is outcome-token balance cache
+    propagation immediately after BUY.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return (
+        "not enough balance" in text
+        or "not enough balance / allowance" in text
+        or "insufficient balance" in text
     )
 
 
@@ -2719,7 +2798,15 @@ async def execute_live_fak(
             if not ok:
                 error = f"{getattr(response, 'code', 'rejected')}: {getattr(response, 'message', '')}".strip()
                 no_match = is_definite_fak_no_match_error(error)
-                reject_status = "REJECTED_NO_MATCH" if no_match else "REJECTED"
+                balance_reject = (
+                    action == "SELL" and reason == "TAKE_PROFIT"
+                    and is_definite_balance_allowance_rejection(error)
+                )
+                reject_status = (
+                    "REJECTED_NO_MATCH" if no_match else
+                    "REJECTED_BALANCE_ALLOWANCE" if balance_reject else
+                    "REJECTED"
+                )
                 with db() as conn:
                     conn.execute("""
                         INSERT INTO live_orders(
@@ -2736,7 +2823,7 @@ async def execute_live_fak(
                 log.warning("LIVE REJECT %s %s %s | %s", name, action, reason, error)
                 return {
                     "ok": False, "filled": 0.0, "error": error,
-                    "retryable": bool(no_match), "status": reject_status,
+                    "retryable": bool(no_match or balance_reject), "status": reject_status,
                 }
 
             making = sf(getattr(response, "making_amount", 0))
@@ -2824,6 +2911,33 @@ async def execute_live_fak(
             # BUY may receive one tightly controlled immediate retry in
             # execute_order(); SELL TP keeps its existing later-cycle retry.
             retryable_no_match = is_definite_fak_no_match_error(e)
+            retryable_balance = (
+                action == "SELL" and reason == "TAKE_PROFIT"
+                and is_definite_balance_allowance_rejection(e)
+            )
+
+            if retryable_balance:
+                with db() as conn:
+                    conn.execute("""
+                        INSERT INTO live_orders(
+                            submitted_ms,condition_id,variant,symbol,asset,outcome,action,reason,
+                            requested_shares,limit_price,order_id,status,filled_shares,avg_price,
+                            gross_amount,fee_estimate,net_or_total,trade_ids_json,response_json,error
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        submitted, condition, name, symbol, asset, outcome, action, reason,
+                        wanted, limit_price, "", "REJECTED_BALANCE_ALLOWANCE", 0.0, None,
+                        0.0, 0.0, 0.0, "[]", "{}", error,
+                    ))
+                    conn.commit()
+                log.warning(
+                    "LIVE TP BALANCE-SYNC REJECT %s | %s %.4fsh | %s",
+                    name, outcome, wanted, error,
+                )
+                return {
+                    "ok": False, "filled": 0.0, "error": error,
+                    "retryable": True, "status": "REJECTED_BALANCE_ALLOWANCE",
+                }
 
             if retryable_no_match:
                 with db() as conn:

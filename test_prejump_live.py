@@ -17,7 +17,7 @@ bot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bot)
 bot.init_db()
 
-assert bot.VERSION.startswith("20.2-")
+assert bot.VERSION.startswith("20.3-")
 assert len(bot.STRATEGIES) == 7
 assert abs(bot.prejump_score() - 0.40) < 1e-12
 assert not bot.trading_enabled()
