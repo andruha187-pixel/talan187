@@ -7,15 +7,15 @@ os.makedirs(TEST_DIR, exist_ok=True)
 os.environ['DATA_DIR']=TEST_DIR
 os.environ['LIVE_MASTER_ENABLE']='1'
 os.environ['PREJUMP_SCORE']='0.40'
-os.environ['LIVE_ENTRY_MAX_SLIPPAGE']='0.03'
+os.environ['LIVE_ENTRY_MAX_SLIPPAGE']='0.05'
 os.environ['FAST_INTERVAL']='0.10'
-# Even if an old deployment still has this legacy env set, v20.5 must not
+# Even if an old deployment still has this legacy env set, v20.6 must not
 # force REST on the first accepted PRE-JUMP FAK.
 os.environ['LIVE_ENTRY_FORCE_REST_BOOK']='1'
 
 spec=importlib.util.spec_from_file_location('bot', os.path.join(os.path.dirname(__file__),'main.py'))
 bot=importlib.util.module_from_spec(spec); spec.loader.exec_module(bot); bot.init_db()
-assert bot.VERSION.startswith('20.5-')
+assert bot.VERSION.startswith('20.6-')
 assert abs(bot.FAST_INTERVAL - 0.10) < 1e-12
 V=bot.STRATEGIES_BY_SYMBOL['BTC'][0]
 bot.state_set(f"mode:{V['name']}", 'LIVE')

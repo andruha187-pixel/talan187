@@ -46,7 +46,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.5-multi7-prejump-live-lowlatency"
+VERSION = "20.6-multi7-prejump-live-event-driven"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -102,7 +102,9 @@ PREJUMP_REQUIRE_BINANCE_BYBIT = os.getenv(
     "PREJUMP_REQUIRE_BINANCE_BYBIT", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 
-# Runtime load controls: score every 250ms, TP every 750ms, trajectory every 3s.
+# Runtime load controls: 100ms fallback scorer + event-driven LIVE entry, TP every 750ms.
+EVENT_DRIVEN_LIVE_ENTRY = os.getenv("EVENT_DRIVEN_LIVE_ENTRY", "1").strip().lower() in {"1", "true", "yes", "on"}
+EVENT_DRIVEN_MIN_INTERVAL_MS = max(0, min(100, int(os.getenv("EVENT_DRIVEN_MIN_INTERVAL_MS", "5"))))
 TP_CHECK_INTERVAL = max(0.25, float(os.getenv("TP_CHECK_INTERVAL", "0.75")))
 TRAJECTORY_INTERVAL = max(1.0, float(os.getenv("TRAJECTORY_INTERVAL", "3.0")))
 
@@ -151,10 +153,10 @@ LIVE_MAX_SHARES_PER_ORDER = float(os.getenv("LIVE_MAX_SHARES_PER_ORDER", "1000")
 LIVE_MIN_SHARES = float(os.getenv("LIVE_MIN_SHARES", "0.01"))
 
 # LIVE ENTRY execution tolerance. PRE-JUMP moves fast, so the visible ask can
-# disappear between signal evaluation and FAK submission. We force a fresh REST
-# book immediately before BUY, allow only this much price movement from the
-# original signal ask, and retry only deterministic zero-fill FAK NO_MATCH.
-LIVE_ENTRY_MAX_SLIPPAGE = max(0.0, float(os.getenv("LIVE_ENTRY_MAX_SLIPPAGE", "0.03")))
+# disappear between signal evaluation and FAK submission. v20.6 sends the first
+# FAK from the fresh WS book, caps price movement from the accepted signal ask,
+# and uses REST only for stale-book recovery / deterministic NO_MATCH retry.
+LIVE_ENTRY_MAX_SLIPPAGE = max(0.0, float(os.getenv("LIVE_ENTRY_MAX_SLIPPAGE", "0.05")))
 LIVE_ENTRY_NO_MATCH_RETRIES = max(0, min(2, int(os.getenv("LIVE_ENTRY_NO_MATCH_RETRIES", "1"))))
 LIVE_ENTRY_RETRY_DELAY_MS = max(0, min(1000, int(os.getenv("LIVE_ENTRY_RETRY_DELAY_MS", "150"))))
 # Legacy compatibility only. v20.5 deliberately does NOT force a REST round-trip
@@ -269,6 +271,13 @@ venue_trade_buckets = defaultdict(lambda: defaultdict(lambda: deque(maxlen=600))
 venue_liq_buckets = defaultdict(lambda: defaultdict(lambda: deque(maxlen=120)))
 venue_sample_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=256)))
 feature_history = defaultdict(lambda: deque(maxlen=512))
+# Event-driven LIVE-entry coordination. The timer loop remains as a 100ms fallback
+# and keeps PAPER behavior unchanged. A per-market lock prevents timer/event races.
+external_eval_events = {symbol: asyncio.Event() for symbol in SYMBOLS}
+external_eval_received_ms = defaultdict(int)
+external_eval_last_run = defaultdict(float)
+prejump_eval_locks = defaultdict(asyncio.Lock)
+live_entry_latency = {}
 source_health = defaultdict(lambda: defaultdict(lambda: {
     "connected": False, "last_ms": 0, "messages": 0, "errors": 0, "last_error": "",
 }))
@@ -1672,8 +1681,9 @@ def handle_bybit_message(symbol, msg):
 
 
 def handle_coinbase_message(msg):
+    touched = set()
     if not isinstance(msg, dict):
-        return
+        return touched
     channel = str(msg.get("channel") or "")
     events = msg.get("events") or []
     if channel in {"l2_data", "level2"}:
@@ -1684,6 +1694,7 @@ def handle_coinbase_message(msg):
             symbol = COINBASE_PRODUCT_TO_SYMBOL.get(product)
             if not symbol:
                 continue
+            touched.add(symbol)
             bids, asks = [], []
             for u in (ev.get("updates") or []):
                 row = [u.get("price_level"), u.get("new_quantity")]
@@ -1702,6 +1713,7 @@ def handle_coinbase_message(msg):
                 symbol = COINBASE_PRODUCT_TO_SYMBOL.get(product)
                 if not symbol:
                     continue
+                touched.add(symbol)
                 # Coinbase side is maker side; taker side is opposite.
                 maker_side = str(tr.get("side") or "").upper()
                 taker_side = "SELL" if maker_side == "BUY" else "BUY"
@@ -1711,6 +1723,24 @@ def handle_coinbase_message(msg):
     elif channel == "heartbeats":
         for symbol in COINBASE_PRODUCTS:
             source_message("coinbase", symbol)
+    return touched
+
+
+def trigger_external_entry_eval(symbol):
+    """Wake the per-symbol LIVE entry evaluator after an external WS update.
+
+    This is deliberately non-blocking for the exchange feed reader. Multiple bursts
+    are coalesced by asyncio.Event; the evaluator can run again immediately if a new
+    event arrives while it is busy.
+    """
+    if not EVENT_DRIVEN_LIVE_ENTRY:
+        return
+    symbol = str(symbol).upper()
+    ev = external_eval_events.get(symbol)
+    if ev is None:
+        return
+    external_eval_received_ms[symbol] = now_ms()
+    ev.set()
 
 
 # ============================================================
@@ -1737,6 +1767,7 @@ async def binance_symbol_loop(symbol):
                     if not isinstance(data, dict):
                         continue
                     handle_binance_payload(symbol, data)
+                    trigger_external_entry_eval(symbol)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1781,6 +1812,7 @@ async def bybit_symbol_loop(symbol):
                             mark_source("bybit", symbol, error=msg.get("ret_msg") or msg)
                         continue
                     handle_bybit_message(symbol, msg)
+                    trigger_external_entry_eval(symbol)
                     if time.monotonic() - last_ping > 20:
                         await ws.send(jd({"op": "ping"}))
                         last_ping = time.monotonic()
@@ -1819,7 +1851,8 @@ async def coinbase_loop():
                 backoff = 1.0
                 async for raw in ws:
                     msg = json.loads(raw)
-                    handle_coinbase_message(msg)
+                    for symbol in handle_coinbase_message(msg):
+                        trigger_external_entry_eval(symbol)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -2662,9 +2695,29 @@ async def _live_entry_retry_valid(condition, variant, asset, outcome, reference_
     return True, "ok"
 
 
+def _entry_latency_line(condition, variant_name):
+    ctx = live_entry_latency.get((condition, variant_name)) or {}
+    bits = []
+    path = str(ctx.get("path") or "")
+    attempt = str(ctx.get("attempt") or "")
+    if path:
+        bits.append(f"path={path}" + (f"/{attempt}" if attempt else ""))
+    for key, label in (
+        ("event_to_signal_ms", "event→signal"),
+        ("signal_to_book_ms", "signal→book"),
+        ("signal_to_submit_ms", "signal→submit"),
+        ("api_response_ms", "API"),
+        ("signal_to_response_ms", "signal→response"),
+    ):
+        if ctx.get(key) is not None:
+            bits.append(f"{label} {si(ctx.get(key))}ms")
+    return " | ".join(bits)
+
+
 async def execute_live_fak(
     condition, variant, asset, outcome, reason, action, wanted,
-    reference_price=None, force_rest=False,
+    reference_price=None, force_rest=False, signal_detected_ms=None,
+    event_received_ms=None, evaluation_path=None,
 ):
     """Place an exact-share FAK order using a freshly checked visible book.
 
@@ -2676,6 +2729,19 @@ async def execute_live_fak(
     symbol = variant["symbol"]
     action = str(action).upper()
     wanted = sf(wanted)
+
+    latency_ctx = None
+    if action == "BUY" and reason == "ENTRY":
+        signal_detected_ms = si(signal_detected_ms, now_ms()) or now_ms()
+        event_received_ms = si(event_received_ms, 0)
+        latency_ctx = {
+            "path": str(evaluation_path or "timer"),
+            "attempt": "retry" if force_rest else "first",
+            "signal_ms": signal_detected_ms,
+            "event_received_ms": event_received_ms or None,
+            "event_to_signal_ms": (max(0, signal_detected_ms - event_received_ms) if event_received_ms else None),
+        }
+        live_entry_latency[(condition, name)] = latency_ctx
 
     if not LIVE_MASTER_ENABLE:
         log.error("LIVE BLOCK %s: LIVE_MASTER_ENABLE=0", name)
@@ -2705,6 +2771,10 @@ async def execute_live_fak(
             await refresh_book(asset)
         else:
             await ensure_book(asset)
+
+        if latency_ctx is not None:
+            latency_ctx["book_ready_ms"] = now_ms()
+            latency_ctx["signal_to_book_ms"] = max(0, latency_ctx["book_ready_ms"] - latency_ctx["signal_ms"])
 
         if action == "BUY" and reason == "ENTRY":
             best_now = best_ask(asset)
@@ -2746,6 +2816,8 @@ async def execute_live_fak(
 
         # Stage 1: build/sign locally. Any exception here is definitely BEFORE
         # submission, therefore it is safe and must never be marked AMBIGUOUS.
+        if latency_ctx is not None:
+            latency_ctx["build_start_ms"] = now_ms()
         try:
             signed = await live_client.create_limit_order(
                 token_id=str(asset),
@@ -2790,12 +2862,20 @@ async def execute_live_fak(
         # Stage 2: from this point onward a submission may occur. Unknown transport
         # failures stay fail-closed; only deterministic FAK NO_MATCH is retry-safe.
         try:
+            if latency_ctx is not None:
+                latency_ctx["submit_ms"] = now_ms()
+                latency_ctx["signal_to_submit_ms"] = max(0, latency_ctx["submit_ms"] - latency_ctx["signal_ms"])
             if sdk_post_order_with_allowance_recovery is not None:
                 response = await sdk_post_order_with_allowance_recovery(live_client, fak_order)
             else:
                 # Test/offline fallback; production requirements pin the SDK version
                 # that provides allowance-recovery placement.
                 response = await live_client.post_order(fak_order)
+
+            if latency_ctx is not None:
+                latency_ctx["response_ms"] = now_ms()
+                latency_ctx["api_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx.get("submit_ms", latency_ctx["response_ms"]))
+                latency_ctx["signal_to_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["signal_ms"])
 
             ok = bool(getattr(response, "ok", False))
             if not ok:
@@ -2889,10 +2969,12 @@ async def execute_live_fak(
                     action, name, reason, outcome, filled, avg, limit_price, status,
                 )
                 if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                    timing = _entry_latency_line(condition, name) if action == "BUY" and reason == "ENTRY" else ""
                     await tg_send(
                         f"🔴 LIVE {action} {symbol}\n"
                         f"{reason} {outcome}: {filled:.4f}sh @ {avg:.4f}\n"
                         f"limit {limit_price:.4f} | {status}"
+                        + (f"\n⏱ {timing}" if timing else "")
                     )
             return {
                 "ok": True,
@@ -2907,6 +2989,10 @@ async def execute_live_fak(
 
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
+            if latency_ctx is not None and latency_ctx.get("submit_ms") is not None:
+                latency_ctx["response_ms"] = now_ms()
+                latency_ctx["api_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["submit_ms"])
+                latency_ctx["signal_to_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["signal_ms"])
 
             # IMPORTANT: a FAK "no orders found to match" rejection is a
             # deterministic zero-fill/kill, not an ambiguous submission. Record
@@ -3131,19 +3217,22 @@ async def _notify_live_entry_not_filled(
     if cap is not None:
         price_bits.append(f"cap {sf(cap):.3f}")
 
+    timing = _entry_latency_line(condition, name)
     await tg_send(
         f"🔎 LIVE ENTRY MISSED {variant['symbol']}\n"
         f"Signal SEEN: {outcome}"
         + (" | " + " | ".join(signal_bits) if signal_bits else "")
         + "\n"
         + " | ".join(price_bits)
+        + (f"\n⏱ {timing}" if timing else "")
         + f"\n{stage}: {str(error or 'not_filled')[:500]}\n"
         + "No position opened. PRE-JUMP ENTRY rules were not changed."
     )
 
 
 async def execute_order(
-    condition, variant, asset, outcome, signal_type, reference_price=None
+    condition, variant, asset, outcome, signal_type, reference_price=None,
+    signal_detected_ms=None, event_received_ms=None, evaluation_path=None,
 ):
     pos_before = position_totals(condition, variant["name"])
     if pos_before["buys"] and pos_before["remaining"] <= 1e-8:
@@ -3159,6 +3248,8 @@ async def execute_order(
     result = await execute_live_fak(
         condition, variant, asset, outcome, signal_type, "BUY", wanted,
         reference_price=reference_price, force_rest=False,
+        signal_detected_ms=signal_detected_ms, event_received_ms=event_received_ms,
+        evaluation_path=evaluation_path,
     )
     if sf(result.get("filled")) > 1e-9:
         return True
@@ -3191,6 +3282,8 @@ async def execute_order(
         retry = await execute_live_fak(
             condition, variant, asset, outcome, signal_type, "BUY", wanted,
             reference_price=reference_price, force_rest=True,
+            signal_detected_ms=signal_detected_ms, event_received_ms=event_received_ms,
+            evaluation_path=evaluation_path,
         )
         if sf(retry.get("filled")) > 1e-9:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -3241,7 +3334,7 @@ def store_prejump_signal(market, variant, asset, outcome, ask, bid, mom, elapsed
         conn.commit()
 
 
-async def evaluate_prejump_variant(market, variant, elapsed, feature):
+async def _evaluate_prejump_variant_unlocked(market, variant, elapsed, feature):
     """One-shot PRE-JUMP gate using the lab's forward-tested 0.40 family."""
     cid = market["condition_id"]
     st = get_variant_state(cid, variant)
@@ -3285,6 +3378,9 @@ async def evaluate_prejump_variant(market, variant, elapsed, feature):
 
     # One signal / one execution attempt per market. Mark the gate BEFORE a
     # LIVE submission: a timeout/ambiguous response must never cause a duplicate.
+    signal_detected_ms = now_ms()
+    event_received_ms = si(feature.get("_event_received_ms"), 0) if feature else 0
+    evaluation_path = str((feature or {}).get("_evaluation_path") or "timer")
     st["gate_decided"] = True
     st["gate_passed"] = True
     st["gate_asset"] = asset
@@ -3304,7 +3400,10 @@ async def evaluate_prejump_variant(market, variant, elapsed, feature):
         directional["score"], threshold, directional["same_votes"], elapsed,
     )
     filled = await execute_order(
-        cid, variant, asset, outcome, "ENTRY", reference_price=ask
+        cid, variant, asset, outcome, "ENTRY", reference_price=ask,
+        signal_detected_ms=signal_detected_ms,
+        event_received_ms=event_received_ms or None,
+        evaluation_path=evaluation_path,
     )
     if not filled:
         log.warning(
@@ -3312,6 +3411,13 @@ async def evaluate_prejump_variant(market, variant, elapsed, feature):
             variant["symbol"], outcome,
         )
     return bool(filled)
+
+
+async def evaluate_prejump_variant(market, variant, elapsed, feature):
+    """Race-safe entry gate shared by timer and event-driven evaluators."""
+    key = (market["condition_id"], variant["name"])
+    async with prejump_eval_locks[key]:
+        return await _evaluate_prejump_variant_unlocked(market, variant, elapsed, feature)
 
 
 def record_position_trajectory(market, variant, elapsed):
@@ -3381,8 +3487,65 @@ def record_position_trajectory(market, variant, elapsed):
     return True
 
 
+async def _event_driven_evaluate_symbol_once(symbol, trigger_ms=None):
+    """Evaluate LIVE PRE-JUMP immediately after an external WS update.
+
+    Signal thresholds are unchanged. PAPER is intentionally left on the timer path
+    so the research comparison is not silently changed.
+    """
+    if not EVENT_DRIVEN_LIVE_ENTRY or not trading_enabled():
+        return False
+    live_variants = [v for v in STRATEGIES_BY_SYMBOL.get(symbol, []) if strategy_mode(v["name"]) == "LIVE"]
+    if not live_variants:
+        return False
+
+    t_ms = now_ms()
+    t_s = time.time()
+    feature = build_external_snapshot(symbol, t_ms)
+    feature["_evaluation_path"] = "event"
+    feature["_event_received_ms"] = si(trigger_ms, t_ms) or t_ms
+    # Do not append venue_sample_history here: its 1/3/10s reference cadence remains
+    # the stable 100ms timer cadence. Current trade/book/flow state is nevertheless
+    # fresh because build_external_snapshot reads the just-updated in-memory feeds.
+    feature_history[symbol].append(feature)
+
+    any_eval = False
+    for cid, market in list(markets.items()):
+        if market_symbol(market) != symbol:
+            continue
+        elapsed = t_s - market["start_ts"]
+        if not (PREJUMP_MIN_ELAPSED <= elapsed <= PREJUMP_MAX_ELAPSED):
+            continue
+        for variant in live_variants:
+            if variant not in strategies_for_market(market):
+                continue
+            any_eval = True
+            await evaluate_prejump_variant(market, variant, elapsed, feature)
+    return any_eval
+
+
+async def event_driven_symbol_loop(symbol):
+    ev = external_eval_events[symbol]
+    while True:
+        await ev.wait()
+        ev.clear()
+        try:
+            if EVENT_DRIVEN_MIN_INTERVAL_MS:
+                elapsed_ms = (time.monotonic() - external_eval_last_run[symbol]) * 1000.0
+                wait_ms = EVENT_DRIVEN_MIN_INTERVAL_MS - elapsed_ms
+                if wait_ms > 0:
+                    await asyncio.sleep(wait_ms / 1000.0)
+            trigger_ms = external_eval_received_ms.get(symbol) or now_ms()
+            await _event_driven_evaluate_symbol_once(symbol, trigger_ms)
+            external_eval_last_run[symbol] = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("event-driven PRE-JUMP evaluator failed | %s", symbol)
+
+
 async def strategy_loop():
-    """250ms PRE-JUMP scorer; no high-frequency research DB persistence."""
+    """100ms fallback scorer + PAPER path; event-driven loop handles LIVE first."""
     while True:
         started = time.monotonic()
         t_s = time.time()
@@ -3395,6 +3558,7 @@ async def strategy_loop():
                 feature = build_external_snapshot(symbol, t_ms)
                 for venue in ("binance", "bybit", "coinbase"):
                     append_venue_feature_history(venue, symbol, feature.get(venue))
+                feature["_evaluation_path"] = "timer"
                 feature_history[symbol].append(feature)
                 current_features[symbol] = feature
 
@@ -3403,7 +3567,7 @@ async def strategy_loop():
                 if not (-2 <= elapsed <= 305):
                     continue
 
-                # 250ms Polymarket ask sampling for the 1-second momentum gate.
+                # 100ms Polymarket ask sampling for the 1-second momentum gate.
                 for asset in (market["up_asset"], market["down_asset"]):
                     ask = best_ask(asset)
                     if ask is not None:
@@ -4295,6 +4459,8 @@ async def main():
         asyncio.create_task(telegram_loop()),
         asyncio.create_task(memory_maintenance_loop()),
     ]
+    if EVENT_DRIVEN_LIVE_ENTRY:
+        tasks += [asyncio.create_task(event_driven_symbol_loop(symbol)) for symbol in SYMBOLS]
     if ENABLE_BINANCE:
         tasks += [asyncio.create_task(binance_symbol_loop(symbol)) for symbol in SYMBOLS]
     if ENABLE_BYBIT:
@@ -4304,9 +4470,10 @@ async def main():
 
     log.info(
         "%s started | symbols=%s | score>=%.2f | window=%.0f..%.0fs | fast=%.2fs | "
-        "TP=%s | live_master=%s | wallet=%s | trading=%s",
+        "event_live=%s/%dms | slippage=%.2f | TP=%s | live_master=%s | wallet=%s | trading=%s",
         VERSION, ",".join(SYMBOLS), prejump_score(), PREJUMP_MIN_ELAPSED, PREJUMP_MAX_ELAPSED,
-        FAST_INTERVAL, format_take_profit(take_profit_usdc()),
+        FAST_INTERVAL, "ON" if EVENT_DRIVEN_LIVE_ENTRY else "OFF", EVENT_DRIVEN_MIN_INTERVAL_MS,
+        LIVE_ENTRY_MAX_SLIPPAGE, format_take_profit(take_profit_usdc()),
         "ON" if LIVE_MASTER_ENABLE else "OFF",
         "READY" if live_client_ready else "NOT READY",
         "ON" if trading_enabled() else "OFF",

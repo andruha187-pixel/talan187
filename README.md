@@ -261,3 +261,43 @@ LIVE_ENTRY_FORCE_REST_BOOK=0
 `LIVE_ENTRY_FORCE_REST_BOOK` is retained only for configuration compatibility;
 v20.5 does not allow an old value of `1` to force a REST round-trip on the first
 accepted PRE-JUMP BUY.
+
+
+## v20.6 event-driven LIVE ENTRY + latency telemetry
+
+PRE-JUMP **rules are unchanged**: score threshold, venue votes, Polymarket price
+band, 1-second momentum gate and 1..160 second window are the same. The change is
+only *when* a LIVE token evaluates those same rules and how quickly an accepted
+signal reaches the CLOB.
+
+- External Binance/Bybit/Coinbase WS updates wake a per-symbol evaluator instead
+  of waiting for the next 100ms fallback tick.
+- The event path is used only for tokens currently in `LIVE`; PAPER remains on
+  the 100ms timer path for clean comparison with the research bot.
+- Bursts are coalesced with `EVENT_DRIVEN_MIN_INTERVAL_MS` (default 5ms) so feed
+  readers stay non-blocking.
+- A per-market/strategy asyncio lock prevents the event path and timer fallback
+  from creating duplicate signals/orders.
+- First FAK still uses the current fresh Polymarket WS book; no mandatory REST
+  RTT is added before submission.
+- Requested LIVE slippage default is now `0.05`, still hard-bounded by
+  `PREJUMP_PRICE_MAX=0.66`.
+- LIVE BUY and `LIVE ENTRY MISSED` Telegram messages include latency telemetry:
+  `event→signal`, `signal→book`, `signal→submit`, API response and total
+  `signal→response` milliseconds.
+
+Recommended env:
+
+```text
+FAST_INTERVAL=0.10
+EVENT_DRIVEN_LIVE_ENTRY=1
+EVENT_DRIVEN_MIN_INTERVAL_MS=5
+LIVE_ENTRY_MAX_SLIPPAGE=0.05
+LIVE_ENTRY_NO_MATCH_RETRIES=1
+LIVE_ENTRY_RETRY_DELAY_MS=150
+LIVE_ENTRY_FORCE_REST_BOOK=0
+```
+
+If `signal→submit` is already only a few/tens of milliseconds but Polymarket ask
+still moves from, for example, 0.57 to 0.75, the remaining gap is market repricing
+rather than the bot's timer/REST latency.
