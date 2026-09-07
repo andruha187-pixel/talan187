@@ -17,7 +17,7 @@ bot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(bot)
 bot.init_db()
 
-assert bot.VERSION.startswith("20.6-")
+assert bot.VERSION.startswith("20.8-")
 assert len(bot.STRATEGIES) == 7
 assert abs(bot.prejump_score() - 0.40) < 1e-12
 assert not bot.trading_enabled()
@@ -38,10 +38,10 @@ except ValueError:
     pass
 bot.set_prejump_score(0.40)
 
-V = bot.STRATEGIES_BY_SYMBOL["BTC"][0]
+V = bot.STRATEGIES_BY_SYMBOL["XRP"][0]
 market = {
     "condition_id": "sig-40",
-    "symbol": "BTC",
+    "symbol": "XRP",
     "up_asset": "UP1",
     "down_asset": "DN1",
     "start_ts": 0,

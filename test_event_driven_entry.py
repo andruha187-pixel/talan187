@@ -13,7 +13,7 @@ os.environ['LIVE_ENTRY_MAX_SLIPPAGE']='0.05'
 
 spec=importlib.util.spec_from_file_location('bot', os.path.join(os.path.dirname(__file__),'main.py'))
 bot=importlib.util.module_from_spec(spec); spec.loader.exec_module(bot); bot.init_db()
-assert bot.VERSION.startswith('20.6-')
+assert bot.VERSION.startswith('20.8-')
 assert bot.EVENT_DRIVEN_LIVE_ENTRY
 assert abs(bot.LIVE_ENTRY_MAX_SLIPPAGE - 0.05) < 1e-12
 V=bot.STRATEGIES_BY_SYMBOL['BTC'][0]
@@ -24,17 +24,17 @@ cid='evt'
 start=time.time()-30
 bot.markets[cid]={'condition_id':cid,'symbol':'BTC','up_asset':'UP','down_asset':'DN','start_ts':start,'end_ts':start+300}
 now=bot.now_ms()
-bot.books['UP']={'bids':{0.56:100},'asks':{0.57:100},'received_ms':now,'source':'ws','tick_size':0.01}
+bot.books['UP']={'bids':{0.53:100},'asks':{0.54:100},'received_ms':now,'source':'ws','tick_size':0.01}
 bot.books['DN']={'bids':{0.42:100},'asks':{0.43:100},'received_ms':now,'source':'ws','tick_size':0.01}
 # Give PM momentum a 1-second reference at the same price.
-bot.fast_pm_history[cid]['UP'].append((now-1000,0.57))
-bot.fast_pm_history[cid]['UP'].append((now,0.57))
+bot.fast_pm_history[cid]['UP'].append((now-1000,0.54))
+bot.fast_pm_history[cid]['UP'].append((now,0.54))
 
 feature={
-    'sample_ms':now,'symbol':'BTC','ext_score':0.42,'up_votes':2,'down_votes':0,'fresh_venues':3,
+    'sample_ms':now,'symbol':'BTC','ext_score':0.44,'up_votes':2,'down_votes':0,'fresh_venues':3,
     'fresh_names':['binance','bybit','coinbase'],
-    'binance':{'fresh':True,'score':0.40},
-    'bybit':{'fresh':True,'score':0.41},
+    'binance':{'fresh':True,'score':0.44},
+    'bybit':{'fresh':True,'score':0.44},
     'coinbase':{'fresh':True,'score':0.10},
 }
 bot.build_external_snapshot=lambda symbol, sample_ms=None: dict(feature)

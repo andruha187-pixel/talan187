@@ -46,7 +46,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.6-multi7-prejump-live-event-driven"
+VERSION = "20.8-multi7-prejump-live-multi-safe"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -101,6 +101,47 @@ PREJUMP_PM_MOM_MAX = float(os.getenv("PREJUMP_PM_MOM_MAX", "0.05"))
 PREJUMP_REQUIRE_BINANCE_BYBIT = os.getenv(
     "PREJUMP_REQUIRE_BINANCE_BYBIT", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+
+# BTC-only first-signal quality filter. IMPORTANT: this is intentionally applied
+# *after* the normal PRE-JUMP 0.40 family has produced its first otherwise-valid
+# candidate (including PM ask/momentum). If that first BTC candidate does not meet
+# these stricter quality limits, the BTC market is skipped permanently. This
+# preserves the historical filter that was tested on the accumulated PAPER data;
+# simply raising the global PREJUMP_SCORE would create a different trade set by
+# allowing a later 0.43+ signal in the same market.
+try:
+    BTC_PREJUMP_SCORE = float(os.getenv("BTC_PREJUMP_SCORE", "0.43").replace(",", "."))
+except Exception:
+    BTC_PREJUMP_SCORE = 0.43
+BTC_PREJUMP_SCORE = max(PREJUMP_SCORE_MIN, min(PREJUMP_SCORE_MAX, BTC_PREJUMP_SCORE))
+try:
+    BTC_PREJUMP_PRICE_MAX = float(os.getenv("BTC_PREJUMP_PRICE_MAX", "0.55").replace(",", "."))
+except Exception:
+    BTC_PREJUMP_PRICE_MAX = 0.55
+BTC_PREJUMP_PRICE_MAX = max(PREJUMP_PRICE_MIN, min(PREJUMP_PRICE_MAX, BTC_PREJUMP_PRICE_MAX))
+
+# Token-specific FIRST-base-signal quality filters derived from the accumulated
+# PAPER report set. They do NOT wait for a later, nicer signal in the same
+# 5-minute market: once the normal PRE-JUMP candidate exists, the relevant
+# token filter either accepts it immediately or permanently closes that market's
+# entry gate. Defaults reproduce the forward-test candidates selected from the
+# historical analysis; every value remains explicit/configurable in Coolify.
+def _safe_float_env(name, default):
+    try:
+        return float(os.getenv(name, str(default)).replace(",", "."))
+    except Exception:
+        return float(default)
+
+SOL_PREJUMP_PM_MOM_MAX = _safe_float_env("SOL_PREJUMP_PM_MOM_MAX", 0.02)
+SOL_PREJUMP_PM_MOM_MAX = max(PREJUMP_PM_MOM_MIN, min(PREJUMP_PM_MOM_MAX, SOL_PREJUMP_PM_MOM_MAX))
+
+XRP_PREJUMP_SCORE = _safe_float_env("XRP_PREJUMP_SCORE", 0.41)
+XRP_PREJUMP_SCORE = max(PREJUMP_SCORE_MIN, min(PREJUMP_SCORE_MAX, XRP_PREJUMP_SCORE))
+
+BNB_PREJUMP_PM_MOM_MIN = _safe_float_env("BNB_PREJUMP_PM_MOM_MIN", 0.01)
+BNB_PREJUMP_PM_MOM_MIN = max(PREJUMP_PM_MOM_MIN, min(PREJUMP_PM_MOM_MAX, BNB_PREJUMP_PM_MOM_MIN))
+
+DOGE_PREJUMP_MAX_SPREAD = max(0.0, _safe_float_env("DOGE_PREJUMP_MAX_SPREAD", 0.02))
 
 # Runtime load controls: 100ms fallback scorer + event-driven LIVE entry, TP every 750ms.
 EVENT_DRIVEN_LIVE_ENTRY = os.getenv("EVENT_DRIVEN_LIVE_ENTRY", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -757,6 +798,20 @@ def format_prejump_score(value=None):
     if value is None:
         value = prejump_score()
     return f"{float(value):.2f}"
+
+
+def safe_first_signal_filter_lines():
+    return [
+        f"BTC SAFE: score >= {BTC_PREJUMP_SCORE:.3f} | ask <= {BTC_PREJUMP_PRICE_MAX:.2f}",
+        f"SOL SAFE: PM mom <= {SOL_PREJUMP_PM_MOM_MAX:+.3f}",
+        f"XRP SAFE: score >= {XRP_PREJUMP_SCORE:.3f}",
+        f"BNB SAFE: PM mom >= {BNB_PREJUMP_PM_MOM_MIN:+.3f}",
+        f"DOGE SAFE: spread <= {DOGE_PREJUMP_MAX_SPREAD:.3f}",
+    ]
+
+
+def safe_first_signal_filter_text():
+    return "\n".join(safe_first_signal_filter_lines())
 
 
 def paper_cash(strategy_name):
@@ -3376,6 +3431,63 @@ async def _evaluate_prejump_variant_unlocked(market, variant, elapsed, feature):
     if mom is None or not (PREJUMP_PM_MOM_MIN <= mom <= PREJUMP_PM_MOM_MAX):
         return False
 
+    # Token-specific SAFE filters. IMPORTANT: these are FIRST-base-signal
+    # filters. The base candidate above is still the normal PRE-JUMP family
+    # (global score/ask/momentum/votes/time). Once the first otherwise-valid
+    # candidate appears for a filtered token, it is either accepted immediately
+    # or the 5-minute market is skipped permanently. No later "better" signal
+    # is allowed to resurrect the market.
+    symbol = str(variant.get("symbol", "")).upper()
+    safe_ok = True
+    safe_reason = ""
+    safe_detail = ""
+
+    if symbol == "BTC":
+        score_ok = directional["score"] + 1e-12 >= BTC_PREJUMP_SCORE
+        ask_ok = ask <= BTC_PREJUMP_PRICE_MAX + 1e-12
+        safe_ok = score_ok and ask_ok
+        if not safe_ok:
+            if not score_ok and not ask_ok:
+                safe_reason = "BTC_FIRST_SIGNAL_FILTER_SCORE_AND_ASK"
+            elif not score_ok:
+                safe_reason = "BTC_FIRST_SIGNAL_FILTER_SCORE"
+            else:
+                safe_reason = "BTC_FIRST_SIGNAL_FILTER_ASK"
+        safe_detail = (
+            f"score={directional['score']:+.3f} need>={BTC_PREJUMP_SCORE:.3f} | "
+            f"ask={ask:.3f} max={BTC_PREJUMP_PRICE_MAX:.2f}"
+        )
+    elif symbol == "SOL":
+        safe_ok = mom <= SOL_PREJUMP_PM_MOM_MAX + 1e-12
+        safe_reason = "SOL_FIRST_SIGNAL_FILTER_MOM_MAX" if not safe_ok else ""
+        safe_detail = f"pmMom={mom:+.3f} max={SOL_PREJUMP_PM_MOM_MAX:+.3f}"
+    elif symbol == "XRP":
+        safe_ok = directional["score"] + 1e-12 >= XRP_PREJUMP_SCORE
+        safe_reason = "XRP_FIRST_SIGNAL_FILTER_SCORE" if not safe_ok else ""
+        safe_detail = f"score={directional['score']:+.3f} need>={XRP_PREJUMP_SCORE:.3f}"
+    elif symbol == "BNB":
+        safe_ok = mom + 1e-12 >= BNB_PREJUMP_PM_MOM_MIN
+        safe_reason = "BNB_FIRST_SIGNAL_FILTER_MOM_MIN" if not safe_ok else ""
+        safe_detail = f"pmMom={mom:+.3f} min={BNB_PREJUMP_PM_MOM_MIN:+.3f}"
+    elif symbol == "DOGE":
+        spread = None if bid is None else ask - bid
+        safe_ok = spread is not None and spread >= -1e-12 and spread <= DOGE_PREJUMP_MAX_SPREAD + 1e-12
+        safe_reason = "DOGE_FIRST_SIGNAL_FILTER_SPREAD" if not safe_ok else ""
+        spread_text = "n/a" if spread is None else f"{spread:.3f}"
+        safe_detail = f"spread={spread_text} max={DOGE_PREJUMP_MAX_SPREAD:.3f} | bid={bid} ask={ask:.3f}"
+
+    if not safe_ok:
+        st["gate_decided"] = True
+        st["gate_passed"] = False
+        st["gate_asset"] = asset
+        ref = ask - mom
+        store_gate_decision(cid, variant, asset, outcome, ask, ref, mom, elapsed, False, safe_reason)
+        log.warning(
+            "%s FIRST-SIGNAL SAFE SKIP %s | %s | elapsed=%.2fs | %s",
+            symbol, outcome, safe_detail, elapsed, safe_reason,
+        )
+        return False
+
     # One signal / one execution attempt per market. Mark the gate BEFORE a
     # LIVE submission: a timeout/ambiguous response must never cause a duplicate.
     signal_detected_ms = now_ms()
@@ -3993,6 +4105,7 @@ async def send_modes():
         + "\n".join(strategy_status_line(v) for v in STRATEGIES)
         + f"\n\nScore: >= {prejump_score():.2f} | window {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s"
         + f"\nPM ask: {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f} | votes >= {PREJUMP_MIN_VENUES}"
+        + f"\n{safe_first_signal_filter_text()}"
         + f"\nLIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'} | wallet: {wallet_flag}"
         + "\n\nCommands:"
         + "\nMODE BTC PAPER"
@@ -4062,7 +4175,8 @@ def format_stats(v, s):
 async def send_statistics():
     lines = [
         "📊 PRE-JUMP STATISTICS",
-        f"Entries: {'ON' if trading_enabled() else 'OFF'} | score >= {prejump_score():.2f}",
+        f"Entries: {'ON' if trading_enabled() else 'OFF'} | base score >= {prejump_score():.2f}",
+        safe_first_signal_filter_text(),
     ]
     for v in STRATEGIES:
         lines.append(format_stats(v, account_stats(v["name"])))
@@ -4154,9 +4268,14 @@ async def request_live(symbol):
         await tg_send(f"🔒 {symbol} has an open position; mode switch blocked until flat.")
         return
     pending_live_confirmations[symbol] = time.time() + 60
+    extra = (
+        f"\n{safe_first_signal_filter_text()}."
+        if symbol == "BTC" else ""
+    )
     await tg_send(
         f"⚠️ REAL MONEY confirmation for {symbol}.\n"
-        f"Current PRE-JUMP score >= {prejump_score():.2f}; ENTRY {entry_shares(v):g} shares.\n"
+        f"Current PRE-JUMP base score >= {prejump_score():.2f}; ENTRY {entry_shares(v):g} shares."
+        f"{extra}\n"
         f"Send exactly: CONFIRM LIVE {symbol}\nExpires in 60 seconds."
     )
 
@@ -4258,8 +4377,9 @@ async def handle_tg(text):
         state_set("trading_enabled", "1")
         await tg_send(
             "▶️ PRE-JUMP STARTED\n"
-            f"Score >= {prejump_score():.2f} | ask {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f} | "
+            f"Base score >= {prejump_score():.2f} | ask {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f} | "
             f"window {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s\n"
+            f"{safe_first_signal_filter_text()}\n"
             f">= {PREJUMP_MIN_VENUES} same-side venues | ENTRY default {ENTRY_ORDER_SIZE:g}sh\n"
             f"TP {format_take_profit(take_profit_usdc())} | no DCA | no stop-loss."
         )
@@ -4358,7 +4478,8 @@ async def telegram_loop():
         f"🤖 {VERSION} online\n"
         f"Tokens: {', '.join(SYMBOLS)} | one PRE-JUMP strategy/token\n"
         f"Entries: {'ON' if trading_enabled() else 'OFF'} | default modes PAPER\n"
-        f"Score >= {prejump_score():.2f} | window {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s\n"
+        f"Base score >= {prejump_score():.2f} | window {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s\n"
+        f"{safe_first_signal_filter_text()}\n"
         f"ENTRY default {ENTRY_ORDER_SIZE:g}sh | TP {format_take_profit(take_profit_usdc())}\n"
         f"Wallet: {'READY' if live_client_ready else 'NOT READY'} | LIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'}\n"
         f"Sources: {_source_summary()}"
@@ -4417,6 +4538,14 @@ async def health(request):
             "require_binance_bybit": PREJUMP_REQUIRE_BINANCE_BYBIT,
             "elapsed_sec": [PREJUMP_MIN_ELAPSED, PREJUMP_MAX_ELAPSED],
             "fast_interval": FAST_INTERVAL,
+            "first_signal_safe_filters": {
+                "BTC": {"min_score": BTC_PREJUMP_SCORE, "max_signal_ask": BTC_PREJUMP_PRICE_MAX},
+                "SOL": {"max_pm_momentum_1s": SOL_PREJUMP_PM_MOM_MAX},
+                "XRP": {"min_score": XRP_PREJUMP_SCORE},
+                "BNB": {"min_pm_momentum_1s": BNB_PREJUMP_PM_MOM_MIN},
+                "DOGE": {"max_spread": DOGE_PREJUMP_MAX_SPREAD},
+                "semantics": "first otherwise-valid base PRE-JUMP candidate; skip market permanently on failure",
+            },
         },
         "take_profit_usdc_net": take_profit_usdc(),
         "modes": {v["symbol"]: strategy_mode(v["name"]) for v in STRATEGIES},

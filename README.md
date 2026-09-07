@@ -5,6 +5,11 @@
 
 ## Стратегия по умолчанию
 
+**v20.8** сохраняет базовый PRE_JUMP 0.40 и поверх первого иначе валидного сигнала
+применяет отдельные SAFE-фильтры для BTC/SOL/XRP/BNB/DOGE. ETH/HYPE остаются
+на базовой логике и автоматически в LIVE не переводятся.
+
+
 - Polymarket 5m Up/Down.
 - Вход один раз на рынок.
 - PM ask: `0.52..0.66`.
@@ -301,3 +306,94 @@ LIVE_ENTRY_FORCE_REST_BOOK=0
 If `signal→submit` is already only a few/tens of milliseconds but Polymarket ask
 still moves from, for example, 0.57 to 0.75, the remaining gap is market repricing
 rather than the bot's timer/REST latency.
+
+## v20.7 BTC SAFE43 — configurable first-signal filter
+
+This build keeps the v20.6 event-driven/low-latency execution and all non-BTC
+PRE-JUMP rules unchanged. It adds two BTC-only environment variables:
+
+```text
+BTC_PREJUMP_SCORE=0.43
+BTC_PREJUMP_PRICE_MAX=0.55
+```
+
+The semantics are deliberately **first normal PRE-JUMP candidate**, not simply a
+higher BTC threshold. The bot first evaluates the existing normal PRE-JUMP family
+(global score, external direction/votes, PM ask 0.52..0.66, 1s PM momentum, time
+window). On the **first otherwise-valid BTC candidate**:
+
+- if directional score >= `BTC_PREJUMP_SCORE` AND signal ask <=
+  `BTC_PREJUMP_PRICE_MAX`, the candidate is accepted and proceeds to the same LIVE
+  execution path as v20.6;
+- otherwise that BTC 5-minute market is permanently skipped. It does **not** wait
+  for a later stronger signal.
+
+This distinction matters because the historical SAFE43 screen was measured on the
+first normal 0.40 PRE-JUMP signal. Merely setting the global score to 0.43 would
+produce a different trade set.
+
+The BTC max above is the **signal ask filter**, not the LIVE fill ceiling. With
+`LIVE_ENTRY_MAX_SLIPPAGE=0.05`, an accepted BTC signal at 0.55 can still submit a
+limit up to 0.60 (subject to the existing global 0.66 safety ceiling).
+
+Recommended values for the currently tested BTC profile:
+
+```text
+PREJUMP_SCORE=0.40
+BTC_PREJUMP_SCORE=0.43
+BTC_PREJUMP_PRICE_MAX=0.55
+LIVE_ENTRY_MAX_SLIPPAGE=0.05
+```
+
+Set `BTC_PREJUMP_SCORE=0.40` and `BTC_PREJUMP_PRICE_MAX=0.66` to effectively return
+BTC to the normal global PRE-JUMP filter.
+
+
+
+## v20.8 MULTI SAFE — first-signal filters for LIVE forward test
+
+Этот build сохраняет v20.6/v20.7 event-driven, FAK, slippage, retry, TP и
+fail-closed execution. Изменена только дополнительная проверка **первого иначе
+валидного базового PRE-JUMP сигнала** для выбранных токенов. Если фильтр не
+пройден, entry gate этого 5-minute рынка закрывается навсегда; более поздний
+сигнал его не возобновляет.
+
+Рекомендуемые значения из текущего 30h PAPER-анализа:
+
+```text
+PREJUMP_SCORE=0.40
+BTC_PREJUMP_SCORE=0.43
+BTC_PREJUMP_PRICE_MAX=0.55
+SOL_PREJUMP_PM_MOM_MAX=0.02
+XRP_PREJUMP_SCORE=0.41
+BNB_PREJUMP_PM_MOM_MIN=0.01
+DOGE_PREJUMP_MAX_SPREAD=0.02
+LIVE_ENTRY_MAX_SLIPPAGE=0.05
+```
+
+Логика:
+
+- BTC: score >= 0.43 AND signal ask <= 0.55;
+- SOL: PM 1s momentum <= +0.02;
+- XRP: score >= 0.41;
+- BNB: PM 1s momentum >= +0.01;
+- DOGE: свежий non-crossed spread `ask-bid` <= 0.02; отсутствующий bid тоже fail;
+- ETH/HYPE: дополнительных SAFE-фильтров нет.
+
+Это параметры для **forward LIVE проверки**, а не гарантия будущего winrate.
+Исторический 100% результат был получен на ограниченной выборке; реальные fills,
+slippage и смена рыночного режима могут дать другой результат. Для первого LIVE
+прогона разумно сохранить текущий маленький размер 5 shares и не повышать его до
+накопления новой forward-выборки.
+
+Regression suite:
+
+```text
+python test_multi_safe_filters.py
+python test_event_driven_entry.py
+python test_low_latency_entry.py
+python test_nomatch_retry.py
+python test_prejump_live.py
+python test_tick_alignment.py
+python test_tp_balance_sync.py
+```
