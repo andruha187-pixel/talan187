@@ -46,7 +46,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.9-multi7-prejump-live-multi-safe-eth-safe"
+VERSION = "20.10-multi7-prejump-live-ultra-low-latency"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -204,16 +204,21 @@ LIVE_MAX_SHARES_PER_ORDER = float(os.getenv("LIVE_MAX_SHARES_PER_ORDER", "1000")
 LIVE_MIN_SHARES = float(os.getenv("LIVE_MIN_SHARES", "0.01"))
 
 # LIVE ENTRY execution tolerance. PRE-JUMP moves fast, so the visible ask can
-# disappear between signal evaluation and FAK submission. v20.6 sends the first
-# FAK from the fresh WS book, caps price movement from the accepted signal ask,
-# and uses REST only for stale-book recovery / deterministic NO_MATCH retry.
+# disappear between signal evaluation and FAK submission. v20.10 sends the first
+# FAK from the already-validated WS book and retries deterministic NO_MATCH
+# immediately from the latest WS book; REST retry is opt-in only.
 LIVE_ENTRY_MAX_SLIPPAGE = max(0.0, float(os.getenv("LIVE_ENTRY_MAX_SLIPPAGE", "0.05")))
 LIVE_ENTRY_NO_MATCH_RETRIES = max(0, min(2, int(os.getenv("LIVE_ENTRY_NO_MATCH_RETRIES", "1"))))
-LIVE_ENTRY_RETRY_DELAY_MS = max(0, min(1000, int(os.getenv("LIVE_ENTRY_RETRY_DELAY_MS", "150"))))
-# Legacy compatibility only. v20.5 deliberately does NOT force a REST round-trip
-# before the first PRE-JUMP FAK. A fresh WS book is used immediately; REST is
-# only used if the book is stale/missing/crossed, or on the controlled NO_MATCH retry.
+LIVE_ENTRY_RETRY_DELAY_MS = max(0, min(1000, int(os.getenv("LIVE_ENTRY_RETRY_DELAY_MS", "0"))))
+LIVE_ENTRY_RETRY_FORCE_REST = os.getenv(
+    "LIVE_ENTRY_RETRY_FORCE_REST", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+# Legacy compatibility only. It never forces REST before the first PRE-JUMP FAK.
 LIVE_ENTRY_FORCE_REST_BOOK = False
+# Safe/read-only authenticated transport keepalive. This never creates an order.
+LIVE_PREWARM_ENABLE = os.getenv("LIVE_PREWARM_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_PREWARM_INTERVAL_SEC = max(10.0, min(300.0, float(os.getenv("LIVE_PREWARM_INTERVAL_SEC", "30"))))
+LIVE_PREWARM_LEAD_SEC = max(1.0, min(30.0, float(os.getenv("LIVE_PREWARM_LEAD_SEC", "3"))))
 LIVE_PRICE_TICK_FALLBACK = max(0.0001, float(os.getenv("LIVE_PRICE_TICK_FALLBACK", "0.01")))
 
 # LIVE TP settlement/CTF balance propagation guard. A successful BUY can be
@@ -874,6 +879,8 @@ live_client_error = ""
 live_order_locks = defaultdict(asyncio.Lock)
 live_tp_retry_after_ms = defaultdict(int)
 live_tp_balance_reject_count = defaultdict(int)
+live_prewarm_lock = asyncio.Lock()
+live_prewarm_last_ms = 0
 
 
 async def init_live_client():
@@ -941,6 +948,62 @@ async def live_collateral_balance():
     except Exception:
         log.exception("LIVE balance read failed")
         return None
+
+
+async def prewarm_live_transport(reason="periodic"):
+    """Warm the authenticated SDK HTTP transport without creating an order.
+
+    A collateral balance/allowance read is safe/read-only and exercises the same
+    authenticated client before a latency-sensitive PRE-JUMP FAK. It is skipped
+    whenever a LIVE order lock is already active so prewarm can never compete
+    with real execution.
+    """
+    global live_prewarm_last_ms
+    if not LIVE_PREWARM_ENABLE or not live_client_ready or live_client is None:
+        return False
+    if any(lock.locked() for lock in live_order_locks.values()):
+        return False
+    t = now_ms()
+    if t - live_prewarm_last_ms < int(LIVE_PREWARM_INTERVAL_SEC * 1000):
+        return False
+    async with live_prewarm_lock:
+        t = now_ms()
+        if t - live_prewarm_last_ms < int(LIVE_PREWARM_INTERVAL_SEC * 1000):
+            return False
+        if any(lock.locked() for lock in live_order_locks.values()):
+            return False
+        started = now_ms()
+        try:
+            await live_client.get_balance_allowance(asset_type="COLLATERAL")
+            live_prewarm_last_ms = now_ms()
+            log.debug("LIVE PREWARM %s OK | %dms", reason, live_prewarm_last_ms - started)
+            return True
+        except Exception as e:
+            # Prewarm is opportunistic only; never changes LIVE readiness or order state.
+            live_prewarm_last_ms = now_ms()
+            log.debug("LIVE PREWARM %s skipped/failed | %s", reason, e)
+            return False
+
+
+async def live_prewarm_loop():
+    """Prewarm once just before each new 5-minute slot.
+
+    Slot-aware scheduling avoids a periodic background request during the normal
+    1..160s PRE-JUMP entry window while still leaving the authenticated transport
+    hot immediately before the next market can signal.
+    """
+    last_target_slot = None
+    while True:
+        now = time.time()
+        next_slot = ((int(now) // 300) + 1) * 300
+        until = next_slot - now
+        if until <= LIVE_PREWARM_LEAD_SEC and last_target_slot != next_slot:
+            await prewarm_live_transport(f"slot-{next_slot}")
+            last_target_slot = next_slot
+            await asyncio.sleep(0.25)
+            continue
+        sleep_for = max(0.25, min(5.0, until - LIVE_PREWARM_LEAD_SEC))
+        await asyncio.sleep(sleep_for)
 
 
 # ============================================================
@@ -2763,28 +2826,48 @@ async def _live_entry_retry_valid(condition, variant, asset, outcome, reference_
 
 
 def _entry_latency_line(condition, variant_name):
-    ctx = live_entry_latency.get((condition, variant_name)) or {}
+    root = live_entry_latency.get((condition, variant_name)) or {}
     bits = []
-    path = str(ctx.get("path") or "")
-    attempt = str(ctx.get("attempt") or "")
+    path = str(root.get("path") or "")
     if path:
-        bits.append(f"path={path}" + (f"/{attempt}" if attempt else ""))
-    for key, label in (
-        ("event_to_signal_ms", "event→signal"),
-        ("signal_to_book_ms", "signal→book"),
-        ("signal_to_submit_ms", "signal→submit"),
-        ("api_response_ms", "API"),
-        ("signal_to_response_ms", "signal→response"),
-    ):
-        if ctx.get(key) is not None:
-            bits.append(f"{label} {si(ctx.get(key))}ms")
+        bits.append(f"path={path}")
+    if root.get("event_to_signal_ms") is not None:
+        bits.append(f"event→signal {si(root.get('event_to_signal_ms'))}ms")
+
+    attempts = root.get("attempts") or []
+    for a in attempts[-2:]:
+        label = str(a.get("label") or "attempt").upper()
+        retry = label.startswith("RETRY")
+        detail = []
+        if retry:
+            if a.get("attempt_to_book_ms") is not None:
+                detail.append(f"start→book {si(a.get('attempt_to_book_ms'))}ms")
+        elif a.get("signal_to_book_ms") is not None:
+            detail.append(f"sig→book {si(a.get('signal_to_book_ms'))}ms")
+        if a.get("build_sign_ms") is not None:
+            detail.append(f"build/sign {si(a.get('build_sign_ms'))}ms")
+        if retry:
+            if a.get("attempt_to_submit_ms") is not None:
+                detail.append(f"start→submit {si(a.get('attempt_to_submit_ms'))}ms")
+        elif a.get("signal_to_submit_ms") is not None:
+            detail.append(f"sig→submit {si(a.get('signal_to_submit_ms'))}ms")
+        if a.get("api_response_ms") is not None:
+            detail.append(f"API {si(a.get('api_response_ms'))}ms")
+        if retry:
+            if a.get("attempt_to_response_ms") is not None:
+                detail.append(f"start→resp {si(a.get('attempt_to_response_ms'))}ms")
+        elif a.get("signal_to_response_ms") is not None:
+            detail.append(f"sig→resp {si(a.get('signal_to_response_ms'))}ms")
+        if detail:
+            bits.append(f"{label}[" + ", ".join(detail) + "]")
     return " | ".join(bits)
 
 
 async def execute_live_fak(
     condition, variant, asset, outcome, reason, action, wanted,
     reference_price=None, force_rest=False, signal_detected_ms=None,
-    event_received_ms=None, evaluation_path=None,
+    event_received_ms=None, evaluation_path=None, attempt_label=None,
+    ws_only=False,
 ):
     """Place an exact-share FAK order using a freshly checked visible book.
 
@@ -2801,14 +2884,23 @@ async def execute_live_fak(
     if action == "BUY" and reason == "ENTRY":
         signal_detected_ms = si(signal_detected_ms, now_ms()) or now_ms()
         event_received_ms = si(event_received_ms, 0)
+        key = (condition, name)
+        root = live_entry_latency.get(key)
+        if not root or str(attempt_label or "first").lower() == "first":
+            root = {
+                "path": str(evaluation_path or "timer"),
+                "signal_ms": signal_detected_ms,
+                "event_received_ms": event_received_ms or None,
+                "event_to_signal_ms": (max(0, signal_detected_ms - event_received_ms) if event_received_ms else None),
+                "attempts": [],
+            }
+            live_entry_latency[key] = root
         latency_ctx = {
-            "path": str(evaluation_path or "timer"),
-            "attempt": "retry" if force_rest else "first",
-            "signal_ms": signal_detected_ms,
-            "event_received_ms": event_received_ms or None,
-            "event_to_signal_ms": (max(0, signal_detected_ms - event_received_ms) if event_received_ms else None),
+            "label": str(attempt_label or ("retry" if force_rest else "first")),
+            "attempt_start_ms": now_ms(),
+            "signal_ms": si(root.get("signal_ms"), signal_detected_ms),
         }
-        live_entry_latency[(condition, name)] = latency_ctx
+        root.setdefault("attempts", []).append(latency_ctx)
 
     if not LIVE_MASTER_ENABLE:
         log.error("LIVE BLOCK %s: LIVE_MASTER_ENABLE=0", name)
@@ -2829,19 +2921,31 @@ async def execute_live_fak(
             log.error("LIVE FAIL-CLOSED %s %s %s: previous submission is ambiguous", name, action, reason)
             return {"ok": False, "filled": 0.0, "error": "previous_submission_ambiguous"}
 
-        # LOW-LATENCY PRE-JUMP execution:
-        # - first BUY uses the already-fresh WS book immediately; no mandatory REST RTT;
-        # - if the book is stale/missing, ensure_book() refreshes it;
-        # - controlled NO_MATCH retry may explicitly pass force_rest=True.
-        # The hard limit-price/slippage cap below still prevents chasing the market.
-        if action == "BUY" and reason == "ENTRY" and force_rest:
-            await refresh_book(asset)
+        # ULTRA-LOW-LATENCY PRE-JUMP execution:
+        # - FIRST uses the already-validated WS book from signal acceptance;
+        # - deterministic NO_MATCH retry uses the latest WS book immediately;
+        # - REST is only used when explicitly requested for rollback/diagnostics.
+        # A stale WS retry can safely no-match because FAK + hard cap cannot chase.
+        if action == "BUY" and reason == "ENTRY":
+            if force_rest:
+                await refresh_book(asset)
+            elif ws_only:
+                # Never add an HTTP RTT on the immediate deterministic retry.
+                pass
+            else:
+                # Signal acceptance already validated freshness. Keep the fallback
+                # for direct/internal calls where that guarantee may be absent.
+                b0 = books.get(asset) or {}
+                age0 = now_ms() - si(b0.get("received_ms")) if b0.get("received_ms") else 999999
+                if not b0.get("asks") or age0 > MAX_BOOK_AGE_MS:
+                    await ensure_book(asset)
         else:
             await ensure_book(asset)
 
         if latency_ctx is not None:
             latency_ctx["book_ready_ms"] = now_ms()
             latency_ctx["signal_to_book_ms"] = max(0, latency_ctx["book_ready_ms"] - latency_ctx["signal_ms"])
+            latency_ctx["attempt_to_book_ms"] = max(0, latency_ctx["book_ready_ms"] - latency_ctx["attempt_start_ms"])
 
         if action == "BUY" and reason == "ENTRY":
             best_now = best_ask(asset)
@@ -2894,6 +2998,9 @@ async def execute_live_fak(
                 post_only=False,
             )
             fak_order = replace(signed, order_type="FAK", post_only=False)
+            if latency_ctx is not None:
+                latency_ctx["build_end_ms"] = now_ms()
+                latency_ctx["build_sign_ms"] = max(0, latency_ctx["build_end_ms"] - latency_ctx.get("build_start_ms", latency_ctx["build_end_ms"]))
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             with db() as conn:
@@ -2932,6 +3039,8 @@ async def execute_live_fak(
             if latency_ctx is not None:
                 latency_ctx["submit_ms"] = now_ms()
                 latency_ctx["signal_to_submit_ms"] = max(0, latency_ctx["submit_ms"] - latency_ctx["signal_ms"])
+                latency_ctx["attempt_to_submit_ms"] = max(0, latency_ctx["submit_ms"] - latency_ctx["attempt_start_ms"])
+            submitted = now_ms()
             if sdk_post_order_with_allowance_recovery is not None:
                 response = await sdk_post_order_with_allowance_recovery(live_client, fak_order)
             else:
@@ -2943,6 +3052,7 @@ async def execute_live_fak(
                 latency_ctx["response_ms"] = now_ms()
                 latency_ctx["api_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx.get("submit_ms", latency_ctx["response_ms"]))
                 latency_ctx["signal_to_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["signal_ms"])
+                latency_ctx["attempt_to_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["attempt_start_ms"])
 
             ok = bool(getattr(response, "ok", False))
             if not ok:
@@ -3060,6 +3170,7 @@ async def execute_live_fak(
                 latency_ctx["response_ms"] = now_ms()
                 latency_ctx["api_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["submit_ms"])
                 latency_ctx["signal_to_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["signal_ms"])
+                latency_ctx["attempt_to_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["attempt_start_ms"])
 
             # IMPORTANT: a FAK "no orders found to match" rejection is a
             # deterministic zero-fill/kill, not an ambiguous submission. Record
@@ -3316,14 +3427,15 @@ async def execute_order(
         condition, variant, asset, outcome, signal_type, "BUY", wanted,
         reference_price=reference_price, force_rest=False,
         signal_detected_ms=signal_detected_ms, event_received_ms=event_received_ms,
-        evaluation_path=evaluation_path,
+        evaluation_path=evaluation_path, attempt_label="first", ws_only=False,
     )
     if sf(result.get("filled")) > 1e-9:
         return True
 
     # Retry ONLY deterministic zero-fill FAK NO_MATCH. Unknown/network/API
-    # failures remain fail-closed inside execute_live_fak. The retry revalidates
-    # direction and then deliberately uses a fresh REST book.
+    # failures remain fail-closed inside execute_live_fak. v20.10 revalidates the
+    # accepted direction and retries immediately from the latest WS book. No REST
+    # RTT is inserted unless LIVE_ENTRY_RETRY_FORCE_REST=1 is explicitly set.
     if not result.get("retryable") or LIVE_ENTRY_NO_MATCH_RETRIES <= 0:
         if str(result.get("status") or "") != "REJECTED_LOCAL":
             await _notify_live_entry_not_filled(
@@ -3348,9 +3460,10 @@ async def execute_order(
 
         retry = await execute_live_fak(
             condition, variant, asset, outcome, signal_type, "BUY", wanted,
-            reference_price=reference_price, force_rest=True,
+            reference_price=reference_price, force_rest=LIVE_ENTRY_RETRY_FORCE_REST,
             signal_detected_ms=signal_detected_ms, event_received_ms=event_received_ms,
-            evaluation_path=evaluation_path,
+            evaluation_path=evaluation_path, attempt_label=f"retry{attempt}",
+            ws_only=not LIVE_ENTRY_RETRY_FORCE_REST,
         )
         if sf(retry.get("filled")) > 1e-9:
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -4607,6 +4720,10 @@ async def main():
         "Accept": "application/json",
     })
     await init_live_client()
+    # One safe/read-only warmup before any trading task starts, so it cannot
+    # compete with a latency-sensitive order on process startup.
+    if LIVE_PREWARM_ENABLE:
+        await prewarm_live_transport("startup")
 
     tasks = [
         asyncio.create_task(web_server()),
@@ -4617,6 +4734,8 @@ async def main():
         asyncio.create_task(telegram_loop()),
         asyncio.create_task(memory_maintenance_loop()),
     ]
+    if LIVE_PREWARM_ENABLE:
+        tasks.append(asyncio.create_task(live_prewarm_loop()))
     if EVENT_DRIVEN_LIVE_ENTRY:
         tasks += [asyncio.create_task(event_driven_symbol_loop(symbol)) for symbol in SYMBOLS]
     if ENABLE_BINANCE:
@@ -4628,10 +4747,13 @@ async def main():
 
     log.info(
         "%s started | symbols=%s | score>=%.2f | window=%.0f..%.0fs | fast=%.2fs | "
-        "event_live=%s/%dms | slippage=%.2f | TP=%s | live_master=%s | wallet=%s | trading=%s",
+        "event_live=%s/%dms | slippage=%.2f | retry=%d/%dms/rest=%s | prewarm=%s/%.0fs | TP=%s | live_master=%s | wallet=%s | trading=%s",
         VERSION, ",".join(SYMBOLS), prejump_score(), PREJUMP_MIN_ELAPSED, PREJUMP_MAX_ELAPSED,
         FAST_INTERVAL, "ON" if EVENT_DRIVEN_LIVE_ENTRY else "OFF", EVENT_DRIVEN_MIN_INTERVAL_MS,
-        LIVE_ENTRY_MAX_SLIPPAGE, format_take_profit(take_profit_usdc()),
+        LIVE_ENTRY_MAX_SLIPPAGE, LIVE_ENTRY_NO_MATCH_RETRIES, LIVE_ENTRY_RETRY_DELAY_MS,
+        "ON" if LIVE_ENTRY_RETRY_FORCE_REST else "OFF",
+        "ON" if LIVE_PREWARM_ENABLE else "OFF", LIVE_PREWARM_INTERVAL_SEC,
+        format_take_profit(take_profit_usdc()),
         "ON" if LIVE_MASTER_ENABLE else "OFF",
         "READY" if live_client_ready else "NOT READY",
         "ON" if trading_enabled() else "OFF",

@@ -13,7 +13,7 @@ os.environ['LIVE_ENTRY_MAX_SLIPPAGE']='0.05'
 
 spec=importlib.util.spec_from_file_location('bot', os.path.join(os.path.dirname(__file__),'main.py'))
 bot=importlib.util.module_from_spec(spec); spec.loader.exec_module(bot); bot.init_db()
-assert bot.VERSION.startswith('20.9-')
+assert bot.VERSION.startswith('20.10-')
 assert bot.EVENT_DRIVEN_LIVE_ENTRY
 assert abs(bot.LIVE_ENTRY_MAX_SLIPPAGE - 0.05) < 1e-12
 V=bot.STRATEGIES_BY_SYMBOL['BTC'][0]

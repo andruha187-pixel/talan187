@@ -1,3 +1,38 @@
+# v20.10 ULTRA LOW LATENCY — immediate WS retry + precise telemetry
+
+Эта версия построена поверх v20.9 ETH SAFE. Все SAFE-фильтры, score/ask,
+TP, размер позиции и slippage не изменены. Изменён только LIVE execution path.
+
+Что изменено:
+
+- первый FAK по-прежнему идёт сразу из уже проверенного WS-стакана, без обязательного REST;
+- после **deterministic FAK NO_MATCH** повтор идёт сразу по последнему WS-стакану;
+- стандартная задержка retry теперь `0 ms`;
+- REST перед retry по умолчанию выключен (`LIVE_ENTRY_RETRY_FORCE_REST=0`);
+- FAK и исходный hard slippage cap остаются обязательными, поэтому второй запрос не может догнать цену выше cap;
+- добавлен безопасный read-only prewarm SDK transport через `get_balance_allowance(COLLATERAL)`; он не создаёт и не подписывает ордер. После startup прогрев выполняется только непосредственно перед новым 5-минутным слотом, а не периодически внутри PRE-JUMP окна;
+- Telegram timing теперь раздельно показывает FIRST и RETRY: `sig→book`, `build/sign`, `sig→submit`, `API`, а для retry — `start→book`, `start→submit`, `API`.
+
+Рекомендуемые execution env:
+
+```env
+LIVE_ENTRY_MAX_SLIPPAGE=0.05
+LIVE_ENTRY_NO_MATCH_RETRIES=1
+LIVE_ENTRY_RETRY_DELAY_MS=0
+LIVE_ENTRY_RETRY_FORCE_REST=0
+LIVE_ENTRY_FORCE_REST_BOOK=0
+LIVE_PREWARM_ENABLE=1
+LIVE_PREWARM_INTERVAL_SEC=30
+LIVE_PREWARM_LEAD_SEC=3
+FAST_INTERVAL=0.10
+EVENT_DRIVEN_LIVE_ENTRY=1
+EVENT_DRIVEN_MIN_INTERVAL_MS=5
+```
+
+Все token-specific SAFE-фильтры v20.9 сохранены без изменений. HYPE остаётся без дополнительного SAFE-фильтра.
+
+---
+
 # MULTI7 PRE-JUMP — PAPER + LIVE
 
 Отдельный торговый бот для BTC/XRP/BNB/SOL/ETH/DOGE/HYPE на логике PRE_JUMP.
