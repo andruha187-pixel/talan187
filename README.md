@@ -1,19 +1,27 @@
-# v20.10 ULTRA LOW LATENCY — immediate WS retry + precise telemetry
+# v20.11 PRESIGN PREWARM — first FAK cold-start fix
 
-Эта версия построена поверх v20.9 ETH SAFE. Все SAFE-фильтры, score/ask,
-TP, размер позиции и slippage не изменены. Изменён только LIVE execution path.
+Эта версия построена поверх v20.10 ULTRA LOW LATENCY. **Стратегия и SAFE-фильтры не менялись.**
+Изменён только путь подготовки LIVE-ордера после того, как реальные логи показали:
 
-Что изменено:
+- SOL FIRST `build/sign = 256ms`, RETRY `5ms`;
+- XRP FIRST `build/sign = 272ms`, RETRY `6ms`.
 
-- первый FAK по-прежнему идёт сразу из уже проверенного WS-стакана, без обязательного REST;
-- после **deterministic FAK NO_MATCH** повтор идёт сразу по последнему WS-стакану;
-- стандартная задержка retry теперь `0 ms`;
-- REST перед retry по умолчанию выключен (`LIVE_ENTRY_RETRY_FORCE_REST=0`);
-- FAK и исходный hard slippage cap остаются обязательными, поэтому второй запрос не может догнать цену выше cap;
-- добавлен безопасный read-only prewarm SDK transport через `get_balance_allowance(COLLATERAL)`; он не создаёт и не подписывает ордер. После startup прогрев выполняется только непосредственно перед новым 5-минутным слотом, а не периодически внутри PRE-JUMP окна;
-- Telegram timing теперь раздельно показывает FIRST и RETRY: `sig→book`, `build/sign`, `sig→submit`, `API`, а для retry — `start→book`, `start→submit`, `API`.
+## Что изменено
 
-Рекомендуемые execution env:
+- За ~12 секунд до следующего 5-минутного слота бот находит уже обнаруженные рынки токенов, которые стоят в `LIVE`.
+- Для **Up и Down** каждого такого рынка выполняется настоящий `create_limit_order()` и локальная подпись.
+- Подписанный объект сразу выбрасывается. **`post_order()` из presign-prewarm не вызывается никогда**, поэтому prewarm не выставляет реальный ордер и не двигает средства.
+- Прогревается именно тот путь SDK, который был холодным на первом FAK: token/market metadata + signer/build.
+- Prewarm запускается после окончания обычного PRE_JUMP entry-window предыдущего рынка и дополнительно не запускается, если сейчас активен реальный LIVE order lock.
+- При переключении токена в LIVE бот также делает best-effort background prewarm, но не конкурирует с активным рынком, если `START` уже включён.
+- Старый read-only transport prewarm через `get_balance_allowance(COLLATERAL)` сохранён.
+- Immediate WS retry из v20.10 сохранён: `0ms`, без REST по умолчанию.
+- Telegram telemetry теперь показывает `warm yes/<N>ms` или `warm no` в FIRST/RETRY.
+- Presign bookkeeping очищается вместе со старыми 5-минутными рынками, чтобы token ids не копились в памяти.
+
+Цель: первый реальный `build/sign` должен стать ближе к уже наблюдавшимся `5–6ms` на RETRY вместо `250–270ms`. Это **не гарантируется заранее** — следующий LIVE лог покажет фактический эффект на сервере. API RTT Polymarket (около 250–370ms в последних логах) этим изменением не устраняется.
+
+## Рекомендуемые execution env
 
 ```env
 LIVE_ENTRY_MAX_SLIPPAGE=0.05
@@ -21,15 +29,38 @@ LIVE_ENTRY_NO_MATCH_RETRIES=1
 LIVE_ENTRY_RETRY_DELAY_MS=0
 LIVE_ENTRY_RETRY_FORCE_REST=0
 LIVE_ENTRY_FORCE_REST_BOOK=0
+
 LIVE_PREWARM_ENABLE=1
 LIVE_PREWARM_INTERVAL_SEC=30
 LIVE_PREWARM_LEAD_SEC=3
+
+LIVE_PRESIGN_PREWARM_ENABLE=1
+LIVE_PRESIGN_PREWARM_LEAD_SEC=12
+LIVE_PRESIGN_PREWARM_SIZE=5
+
 FAST_INTERVAL=0.10
 EVENT_DRIVEN_LIVE_ENTRY=1
 EVENT_DRIVEN_MIN_INTERVAL_MS=5
 ```
 
-Все token-specific SAFE-фильтры v20.9 сохранены без изменений. HYPE остаётся без дополнительного SAFE-фильтра.
+Все BTC/SOL/XRP/BNB/DOGE/ETH SAFE-фильтры из v20.9/v20.10 сохранены как есть. HYPE не менялся.
+
+## Как проверить, что fix реально сработал
+
+Перед новым слотом в Coolify log должны появляться строки вида:
+
+```text
+LIVE PRESIGN WARM XRP Up ... build/sign=...ms | LOCAL ONLY / NOT POSTED
+LIVE PRESIGN WARM XRP Down ... build/sign=...ms | LOCAL ONLY / NOT POSTED
+```
+
+А следующий `LIVE BUY` / `LIVE ENTRY MISSED` покажет:
+
+```text
+FIRST[warm yes/260ms, sig→book 2ms, build/sign 6ms, sig→submit 8ms, API ...]
+```
+
+`warm yes/260ms` означает, что 260ms были потрачены **заранее**, до начала 5-минутного рынка, а не во время сигнала. Важная цифра — новый FIRST `build/sign`.
 
 ---
 

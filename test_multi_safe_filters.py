@@ -24,7 +24,7 @@ spec.loader.exec_module(bot)
 bot.init_db()
 bot.set_prejump_score(0.40)
 
-assert bot.VERSION.startswith("20.10-")
+assert bot.VERSION.startswith("20.11-")
 assert abs(bot.BTC_PREJUMP_SCORE - 0.43) < 1e-12
 assert abs(bot.BTC_PREJUMP_PRICE_MAX - 0.55) < 1e-12
 assert abs(bot.SOL_PREJUMP_PM_MOM_MAX - 0.02) < 1e-12

@@ -35,6 +35,7 @@ load_dotenv()
 
 # ============================================================
 # MULTI7 PRE-JUMP — PAPER + LIVE
+# v20.11 adds local-only per-token create/sign prewarm for upcoming LIVE markets.
 # ============================================================
 # Signal copied from the forward-tested PRE-JUMP lab:
 #   external composite score >= runtime threshold (default 0.40)
@@ -46,7 +47,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.10-multi7-prejump-live-ultra-low-latency"
+VERSION = "20.11-multi7-prejump-live-presign-prewarm"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -204,7 +205,7 @@ LIVE_MAX_SHARES_PER_ORDER = float(os.getenv("LIVE_MAX_SHARES_PER_ORDER", "1000")
 LIVE_MIN_SHARES = float(os.getenv("LIVE_MIN_SHARES", "0.01"))
 
 # LIVE ENTRY execution tolerance. PRE-JUMP moves fast, so the visible ask can
-# disappear between signal evaluation and FAK submission. v20.10 sends the first
+# disappear between signal evaluation and FAK submission. v20.11 sends the first
 # FAK from the already-validated WS book and retries deterministic NO_MATCH
 # immediately from the latest WS book; REST retry is opt-in only.
 LIVE_ENTRY_MAX_SLIPPAGE = max(0.0, float(os.getenv("LIVE_ENTRY_MAX_SLIPPAGE", "0.05")))
@@ -219,6 +220,16 @@ LIVE_ENTRY_FORCE_REST_BOOK = False
 LIVE_PREWARM_ENABLE = os.getenv("LIVE_PREWARM_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
 LIVE_PREWARM_INTERVAL_SEC = max(10.0, min(300.0, float(os.getenv("LIVE_PREWARM_INTERVAL_SEC", "30"))))
 LIVE_PREWARM_LEAD_SEC = max(1.0, min(30.0, float(os.getenv("LIVE_PREWARM_LEAD_SEC", "3"))))
+# v20.11: warm the *actual local order build/sign path* for the next 5-minute
+# market. create_limit_order() is called for both outcome tokens, but the signed
+# object is discarded and post_order() is NEVER called by prewarm. This is meant
+# to move lazy token/market metadata and signer initialization out of the first
+# latency-sensitive PRE-JUMP FAK.
+LIVE_PRESIGN_PREWARM_ENABLE = os.getenv(
+    "LIVE_PRESIGN_PREWARM_ENABLE", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+LIVE_PRESIGN_PREWARM_LEAD_SEC = max(3.0, min(60.0, float(os.getenv("LIVE_PRESIGN_PREWARM_LEAD_SEC", "12"))))
+LIVE_PRESIGN_PREWARM_SIZE = min(LIVE_MAX_SHARES_PER_ORDER, max(5.0, float(os.getenv("LIVE_PRESIGN_PREWARM_SIZE", "5"))))
 LIVE_PRICE_TICK_FALLBACK = max(0.0001, float(os.getenv("LIVE_PRICE_TICK_FALLBACK", "0.01")))
 
 # LIVE TP settlement/CTF balance propagation guard. A successful BUY can be
@@ -881,6 +892,10 @@ live_tp_retry_after_ms = defaultdict(int)
 live_tp_balance_reject_count = defaultdict(int)
 live_prewarm_lock = asyncio.Lock()
 live_prewarm_last_ms = 0
+live_presign_prewarm_lock = asyncio.Lock()
+live_presign_warmed_assets = set()
+live_presign_warm_ms = {}
+live_presign_warm_failures = defaultdict(int)
 
 
 async def init_live_client():
@@ -985,24 +1000,162 @@ async def prewarm_live_transport(reason="periodic"):
             return False
 
 
-async def live_prewarm_loop():
-    """Prewarm once just before each new 5-minute slot.
+async def prewarm_live_asset_signer(market, asset, outcome):
+    """Exercise the real local create/sign path without ever submitting an order.
 
-    Slot-aware scheduling avoids a periodic background request during the normal
-    1..160s PRE-JUMP entry window while still leaving the authenticated transport
-    hot immediately before the next market can signal.
+    Safety invariant: this function calls create_limit_order() only. It does not
+    call post_order(), sdk_post_order_with_allowance_recovery(), or any other
+    placement method. The returned signed object is discarded immediately.
     """
-    last_target_slot = None
+    asset = str(asset or "")
+    if not asset or not LIVE_PRESIGN_PREWARM_ENABLE:
+        return False
+    if not live_client_ready or live_client is None:
+        return False
+    if asset in live_presign_warmed_assets:
+        return True
+    # Never compete with a real LIVE action. The slot prewarm runs after the
+    # previous market's 160s entry window, but this extra guard is fail-safe.
+    if any(lock.locked() for lock in live_order_locks.values()):
+        return False
+
+    symbol = market_symbol(market)
+    variant = strategy_for(symbol)
+    if not variant or strategy_mode(variant["name"]) != "LIVE":
+        return False
+
+    # Use a boring, valid mid-price and a normal share size. Nothing is posted,
+    # so this price has no trading effect; it only forces the SDK to resolve the
+    # token/market metadata and execute the same signing path as a real ENTRY.
+    price_dec = _normalize_live_limit_price(asset, 0.50, "BUY")
+    price_str = format(price_dec, "f")
+    size_str = format(Decimal(str(LIVE_PRESIGN_PREWARM_SIZE)), "f")
+    started = now_ms()
+    try:
+        signed = await live_client.create_limit_order(
+            token_id=asset,
+            price=price_str,
+            size=size_str,
+            side="BUY",
+            post_only=False,
+        )
+        # Match the real ENTRY's final local conversion too, still without POST.
+        _ = replace(signed, order_type="FAK", post_only=False)
+        elapsed = max(0, now_ms() - started)
+        live_presign_warmed_assets.add(asset)
+        live_presign_warm_ms[asset] = elapsed
+        log.info(
+            "LIVE PRESIGN WARM %s %s | token=%s | build/sign=%dms | LOCAL ONLY / NOT POSTED",
+            symbol, outcome, asset[-10:], elapsed,
+        )
+        return True
+    except Exception as e:
+        live_presign_warm_failures[asset] += 1
+        log.warning(
+            "LIVE PRESIGN WARM %s %s failed | token=%s | %s",
+            symbol, outcome, asset[-10:], e,
+        )
+        return False
+
+
+async def prewarm_live_slot_signers(slot_start):
+    """Pre-sign both outcome tokens for LIVE symbols in the upcoming slot."""
+    if not LIVE_PRESIGN_PREWARM_ENABLE or not live_client_ready or live_client is None:
+        return 0, 0
+    # The function is called shortly before the next slot. At that point the
+    # previous market is outside PREJUMP_MAX_ELAPSED, so this cannot steal time
+    # from a normal new ENTRY. Still skip if a real order is currently active.
+    if any(lock.locked() for lock in live_order_locks.values()):
+        return 0, 0
+
+    targets = []
+    live_symbols = set()
+    for symbol in SYMBOLS:
+        v = strategy_for(symbol)
+        if v and strategy_mode(v["name"]) == "LIVE":
+            live_symbols.add(symbol)
+    if not live_symbols:
+        return 0, 0
+
+    for market in list(markets.values()):
+        if si(market.get("start_ts")) != si(slot_start):
+            continue
+        symbol = market_symbol(market)
+        if symbol not in live_symbols:
+            continue
+        targets.append((market, str(market.get("up_asset") or ""), "Up"))
+        targets.append((market, str(market.get("down_asset") or ""), "Down"))
+
+    expected = len(targets)
+    if not expected:
+        return 0, 0
+
+    warmed = 0
+    async with live_presign_prewarm_lock:
+        for market, asset, outcome in targets:
+            if not asset:
+                continue
+            if asset in live_presign_warmed_assets:
+                warmed += 1
+                continue
+            # Stop immediately if a real order appeared while warming assets.
+            if any(lock.locked() for lock in live_order_locks.values()):
+                break
+            if await prewarm_live_asset_signer(market, asset, outcome):
+                warmed += 1
+    return warmed, expected
+
+
+async def prewarm_symbol_current_or_next(symbol):
+    """Best-effort pre-sign when a symbol is switched to LIVE.
+
+    Active-slot warming is intentionally skipped while entries are ON, because
+    a background signer warmup must never delay a real PRE-JUMP order.
+    """
+    if not LIVE_PRESIGN_PREWARM_ENABLE or not live_client_ready or live_client is None:
+        return False
+    symbol = str(symbol).upper()
+    now = time.time()
+    candidates = [m for m in markets.values() if market_symbol(m) == symbol and sf(m.get("end_ts")) > now]
+    if not candidates:
+        return False
+    candidates.sort(key=lambda m: (sf(m.get("start_ts")) < now, abs(sf(m.get("start_ts")) - now)))
+    for market in candidates:
+        start_ts = sf(market.get("start_ts"))
+        # Future market is always safe to prewarm. Current market is warmable only
+        # when global entries are OFF, so no latency-sensitive real order can race.
+        if start_ts <= now and trading_enabled():
+            continue
+        async with live_presign_prewarm_lock:
+            ok1 = await prewarm_live_asset_signer(market, market.get("up_asset"), "Up")
+            ok2 = await prewarm_live_asset_signer(market, market.get("down_asset"), "Down")
+        return bool(ok1 and ok2)
+    return False
+
+
+async def live_prewarm_loop():
+    """Prewarm transport and the actual build/sign path before each 5m slot."""
+    last_transport_slot = None
     while True:
         now = time.time()
         next_slot = ((int(now) // 300) + 1) * 300
         until = next_slot - now
-        if until <= LIVE_PREWARM_LEAD_SEC and last_target_slot != next_slot:
+
+        # Start signer warming earlier than the transport ping. Repeated calls in
+        # this short lead window are cheap because successfully warmed token ids
+        # are cached in live_presign_warmed_assets. If discovery has not found a
+        # future market yet, the next loop retries instead of giving up the slot.
+        if LIVE_PRESIGN_PREWARM_ENABLE and until <= LIVE_PRESIGN_PREWARM_LEAD_SEC:
+            warmed, expected = await prewarm_live_slot_signers(next_slot)
+            if expected and warmed == expected:
+                log.debug("LIVE PRESIGN SLOT %s ready | %d/%d assets", next_slot, warmed, expected)
+
+        if until <= LIVE_PREWARM_LEAD_SEC and last_transport_slot != next_slot:
             await prewarm_live_transport(f"slot-{next_slot}")
-            last_target_slot = next_slot
-            await asyncio.sleep(0.25)
-            continue
-        sleep_for = max(0.25, min(5.0, until - LIVE_PREWARM_LEAD_SEC))
+            last_transport_slot = next_slot
+
+        lead = max(LIVE_PREWARM_LEAD_SEC, LIVE_PRESIGN_PREWARM_LEAD_SEC if LIVE_PRESIGN_PREWARM_ENABLE else 0)
+        sleep_for = max(0.25, min(2.0, until - lead))
         await asyncio.sleep(sleep_for)
 
 
@@ -2035,6 +2188,13 @@ def cleanup_resolved_market_memory():
     for asset in list(books):
         if asset not in keep_assets:
             books.pop(asset, None)
+    # v20.11 signer-prewarm bookkeeping follows the same market lifecycle so
+    # unique 5-minute token ids cannot accumulate forever in memory.
+    live_presign_warmed_assets.intersection_update(keep_assets)
+    for asset in list(live_presign_warm_ms):
+        if asset not in keep_assets:
+            live_presign_warm_ms.pop(asset, None)
+            live_presign_warm_failures.pop(asset, None)
     subscribed_assets.intersection_update(keep_assets)
     return len(old_cids)
 
@@ -2839,6 +2999,11 @@ def _entry_latency_line(condition, variant_name):
         label = str(a.get("label") or "attempt").upper()
         retry = label.startswith("RETRY")
         detail = []
+        if a.get("presign_warmed") is not None:
+            warm_txt = "yes" if a.get("presign_warmed") else "no"
+            if a.get("presign_warm_ms") is not None:
+                warm_txt += f"/{si(a.get('presign_warm_ms'))}ms"
+            detail.append(f"warm {warm_txt}")
         if retry:
             if a.get("attempt_to_book_ms") is not None:
                 detail.append(f"start→book {si(a.get('attempt_to_book_ms'))}ms")
@@ -2899,6 +3064,8 @@ async def execute_live_fak(
             "label": str(attempt_label or ("retry" if force_rest else "first")),
             "attempt_start_ms": now_ms(),
             "signal_ms": si(root.get("signal_ms"), signal_detected_ms),
+            "presign_warmed": str(asset) in live_presign_warmed_assets,
+            "presign_warm_ms": live_presign_warm_ms.get(str(asset)),
         }
         root.setdefault("attempts", []).append(latency_ctx)
 
@@ -3433,7 +3600,7 @@ async def execute_order(
         return True
 
     # Retry ONLY deterministic zero-fill FAK NO_MATCH. Unknown/network/API
-    # failures remain fail-closed inside execute_live_fak. v20.10 revalidates the
+    # failures remain fail-closed inside execute_live_fak. v20.11 revalidates the
     # accepted direction and retries immediately from the latest WS book. No REST
     # RTT is inserted unless LIVE_ENTRY_RETRY_FORCE_REST=1 is explicitly set.
     if not result.get("retryable") or LIVE_ENTRY_NO_MATCH_RETRIES <= 0:
@@ -4432,6 +4599,10 @@ async def confirm_live(symbol):
         return
     ok, msg = _set_mode_direct(v, "LIVE")
     await tg_send(f"🔴 {symbol} = LIVE" if ok else f"LIVE switch blocked: {msg}")
+    if ok and LIVE_PRESIGN_PREWARM_ENABLE:
+        # Background/local only. It never posts an order and skips active-slot
+        # warming while entries are ON.
+        asyncio.create_task(prewarm_symbol_current_or_next(symbol))
 
 
 async def send_take_profit():
@@ -4734,7 +4905,7 @@ async def main():
         asyncio.create_task(telegram_loop()),
         asyncio.create_task(memory_maintenance_loop()),
     ]
-    if LIVE_PREWARM_ENABLE:
+    if LIVE_PREWARM_ENABLE or LIVE_PRESIGN_PREWARM_ENABLE:
         tasks.append(asyncio.create_task(live_prewarm_loop()))
     if EVENT_DRIVEN_LIVE_ENTRY:
         tasks += [asyncio.create_task(event_driven_symbol_loop(symbol)) for symbol in SYMBOLS]
@@ -4747,12 +4918,13 @@ async def main():
 
     log.info(
         "%s started | symbols=%s | score>=%.2f | window=%.0f..%.0fs | fast=%.2fs | "
-        "event_live=%s/%dms | slippage=%.2f | retry=%d/%dms/rest=%s | prewarm=%s/%.0fs | TP=%s | live_master=%s | wallet=%s | trading=%s",
+        "event_live=%s/%dms | slippage=%.2f | retry=%d/%dms/rest=%s | transport_prewarm=%s/%.0fs | presign_prewarm=%s/%.0fs | TP=%s | live_master=%s | wallet=%s | trading=%s",
         VERSION, ",".join(SYMBOLS), prejump_score(), PREJUMP_MIN_ELAPSED, PREJUMP_MAX_ELAPSED,
         FAST_INTERVAL, "ON" if EVENT_DRIVEN_LIVE_ENTRY else "OFF", EVENT_DRIVEN_MIN_INTERVAL_MS,
         LIVE_ENTRY_MAX_SLIPPAGE, LIVE_ENTRY_NO_MATCH_RETRIES, LIVE_ENTRY_RETRY_DELAY_MS,
         "ON" if LIVE_ENTRY_RETRY_FORCE_REST else "OFF",
         "ON" if LIVE_PREWARM_ENABLE else "OFF", LIVE_PREWARM_INTERVAL_SEC,
+        "ON" if LIVE_PRESIGN_PREWARM_ENABLE else "OFF", LIVE_PRESIGN_PREWARM_LEAD_SEC,
         format_take_profit(take_profit_usdc()),
         "ON" if LIVE_MASTER_ENABLE else "OFF",
         "READY" if live_client_ready else "NOT READY",
