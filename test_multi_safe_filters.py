@@ -14,6 +14,8 @@ os.environ["SOL_PREJUMP_PM_MOM_MAX"] = "0.02"
 os.environ["XRP_PREJUMP_SCORE"] = "0.41"
 os.environ["BNB_PREJUMP_PM_MOM_MIN"] = "0.01"
 os.environ["DOGE_PREJUMP_MAX_SPREAD"] = "0.02"
+os.environ["ETH_PREJUMP_SCORE"] = "0.455"
+os.environ["ETH_PREJUMP_PM_MOM_MAX"] = "0.02"
 os.environ["LIVE_MASTER_ENABLE"] = "0"
 
 spec = importlib.util.spec_from_file_location("bot", os.path.join(os.path.dirname(__file__), "main.py"))
@@ -22,13 +24,15 @@ spec.loader.exec_module(bot)
 bot.init_db()
 bot.set_prejump_score(0.40)
 
-assert bot.VERSION.startswith("20.8-")
+assert bot.VERSION.startswith("20.9-")
 assert abs(bot.BTC_PREJUMP_SCORE - 0.43) < 1e-12
 assert abs(bot.BTC_PREJUMP_PRICE_MAX - 0.55) < 1e-12
 assert abs(bot.SOL_PREJUMP_PM_MOM_MAX - 0.02) < 1e-12
 assert abs(bot.XRP_PREJUMP_SCORE - 0.41) < 1e-12
 assert abs(bot.BNB_PREJUMP_PM_MOM_MIN - 0.01) < 1e-12
 assert abs(bot.DOGE_PREJUMP_MAX_SPREAD - 0.02) < 1e-12
+assert abs(bot.ETH_PREJUMP_SCORE - 0.455) < 1e-12
+assert abs(bot.ETH_PREJUMP_PM_MOM_MAX - 0.02) < 1e-12
 
 ask_now = 0.54
 bid_now = 0.53
@@ -117,8 +121,13 @@ async def run():
     await expect_fail_then_stays_skipped("DOGE", "doge-fail", 0.44, 0.56, 0.53, 0.00, later_ask=0.55, later_bid=0.54)
     await expect_pass("DOGE", "doge-pass", 0.44, 0.55, 0.53, 0.00)
 
-    # ETH is intentionally unfiltered by SAFE rules; base PRE-JUMP remains intact.
-    await expect_pass("ETH", "eth-base", 0.44, 0.54, 0.53, 0.00)
+    # ETH: first-signal score >= .455 AND PM momentum <= +.02.
+    await expect_fail_then_stays_skipped("ETH", "eth-score-fail", 0.45, 0.54, 0.53, 0.00, later_score=0.49)
+    await expect_fail_then_stays_skipped("ETH", "eth-mom-fail", 0.47, 0.54, 0.53, 0.03, later_mom=0.01)
+    await expect_pass("ETH", "eth-pass", 0.455, 0.54, 0.53, 0.02)
+
+    # HYPE remains intentionally unfiltered; base PRE-JUMP passes unchanged.
+    await expect_pass("HYPE", "hype-base", 0.40, 0.54, 0.53, 0.00)
 
 asyncio.run(run())
-print("MULTI SAFE first-signal regressions: OK")
+print("MULTI SAFE + ETH first-signal regressions: OK")

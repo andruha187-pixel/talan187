@@ -46,7 +46,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.8-multi7-prejump-live-multi-safe"
+VERSION = "20.9-multi7-prejump-live-multi-safe-eth-safe"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -142,6 +142,16 @@ BNB_PREJUMP_PM_MOM_MIN = _safe_float_env("BNB_PREJUMP_PM_MOM_MIN", 0.01)
 BNB_PREJUMP_PM_MOM_MIN = max(PREJUMP_PM_MOM_MIN, min(PREJUMP_PM_MOM_MAX, BNB_PREJUMP_PM_MOM_MIN))
 
 DOGE_PREJUMP_MAX_SPREAD = max(0.0, _safe_float_env("DOGE_PREJUMP_MAX_SPREAD", 0.02))
+
+# ETH FIRST-base-signal filter validated on the accumulated PAPER set plus the
+# subsequent six-hour forward batch. The first otherwise-valid base PRE-JUMP
+# candidate must satisfy BOTH limits; a failure permanently skips that 5-minute
+# ETH market. HYPE intentionally remains unfiltered.
+ETH_PREJUMP_SCORE = _safe_float_env("ETH_PREJUMP_SCORE", 0.455)
+ETH_PREJUMP_SCORE = max(PREJUMP_SCORE_MIN, min(PREJUMP_SCORE_MAX, ETH_PREJUMP_SCORE))
+
+ETH_PREJUMP_PM_MOM_MAX = _safe_float_env("ETH_PREJUMP_PM_MOM_MAX", 0.02)
+ETH_PREJUMP_PM_MOM_MAX = max(PREJUMP_PM_MOM_MIN, min(PREJUMP_PM_MOM_MAX, ETH_PREJUMP_PM_MOM_MAX))
 
 # Runtime load controls: 100ms fallback scorer + event-driven LIVE entry, TP every 750ms.
 EVENT_DRIVEN_LIVE_ENTRY = os.getenv("EVENT_DRIVEN_LIVE_ENTRY", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -807,6 +817,8 @@ def safe_first_signal_filter_lines():
         f"XRP SAFE: score >= {XRP_PREJUMP_SCORE:.3f}",
         f"BNB SAFE: PM mom >= {BNB_PREJUMP_PM_MOM_MIN:+.3f}",
         f"DOGE SAFE: spread <= {DOGE_PREJUMP_MAX_SPREAD:.3f}",
+        f"ETH SAFE: score >= {ETH_PREJUMP_SCORE:.3f} | PM mom <= {ETH_PREJUMP_PM_MOM_MAX:+.3f}",
+        "HYPE SAFE: none (base PRE-JUMP only)",
     ]
 
 
@@ -3475,6 +3487,21 @@ async def _evaluate_prejump_variant_unlocked(market, variant, elapsed, feature):
         safe_reason = "DOGE_FIRST_SIGNAL_FILTER_SPREAD" if not safe_ok else ""
         spread_text = "n/a" if spread is None else f"{spread:.3f}"
         safe_detail = f"spread={spread_text} max={DOGE_PREJUMP_MAX_SPREAD:.3f} | bid={bid} ask={ask:.3f}"
+    elif symbol == "ETH":
+        score_ok = directional["score"] + 1e-12 >= ETH_PREJUMP_SCORE
+        mom_ok = mom <= ETH_PREJUMP_PM_MOM_MAX + 1e-12
+        safe_ok = score_ok and mom_ok
+        if not safe_ok:
+            if not score_ok and not mom_ok:
+                safe_reason = "ETH_FIRST_SIGNAL_FILTER_SCORE_AND_MOM"
+            elif not score_ok:
+                safe_reason = "ETH_FIRST_SIGNAL_FILTER_SCORE"
+            else:
+                safe_reason = "ETH_FIRST_SIGNAL_FILTER_MOM_MAX"
+        safe_detail = (
+            f"score={directional['score']:+.3f} need>={ETH_PREJUMP_SCORE:.3f} | "
+            f"pmMom={mom:+.3f} max={ETH_PREJUMP_PM_MOM_MAX:+.3f}"
+        )
 
     if not safe_ok:
         st["gate_decided"] = True
@@ -4544,6 +4571,8 @@ async def health(request):
                 "XRP": {"min_score": XRP_PREJUMP_SCORE},
                 "BNB": {"min_pm_momentum_1s": BNB_PREJUMP_PM_MOM_MIN},
                 "DOGE": {"max_spread": DOGE_PREJUMP_MAX_SPREAD},
+                "ETH": {"min_score": ETH_PREJUMP_SCORE, "max_pm_momentum_1s": ETH_PREJUMP_PM_MOM_MAX},
+                "HYPE": {"filter": None, "mode": "base_prejump_only"},
                 "semantics": "first otherwise-valid base PRE-JUMP candidate; skip market permanently on failure",
             },
         },

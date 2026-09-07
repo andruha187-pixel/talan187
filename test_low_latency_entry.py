@@ -15,7 +15,7 @@ os.environ['LIVE_ENTRY_FORCE_REST_BOOK']='1'
 
 spec=importlib.util.spec_from_file_location('bot', os.path.join(os.path.dirname(__file__),'main.py'))
 bot=importlib.util.module_from_spec(spec); spec.loader.exec_module(bot); bot.init_db()
-assert bot.VERSION.startswith('20.8-')
+assert bot.VERSION.startswith('20.9-')
 assert abs(bot.FAST_INTERVAL - 0.10) < 1e-12
 V=bot.STRATEGIES_BY_SYMBOL['BTC'][0]
 bot.state_set(f"mode:{V['name']}", 'LIVE')
