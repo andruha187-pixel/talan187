@@ -12,7 +12,7 @@ os.environ['LIVE_PREWARM_ENABLE']='0'
 
 spec=importlib.util.spec_from_file_location('bot', os.path.join(os.path.dirname(__file__),'main.py'))
 bot=importlib.util.module_from_spec(spec); spec.loader.exec_module(bot); bot.init_db()
-assert bot.VERSION.startswith('20.11-')
+assert bot.VERSION.startswith('20.12-')
 
 V=bot.STRATEGIES_BY_SYMBOL['BTC'][0]
 bot.state_set(f"mode:{V['name']}", 'LIVE')
@@ -59,4 +59,4 @@ assert all(float(x['price'])==0.50 for x in client.builds)
 warmed2, expected2 = asyncio.run(bot.prewarm_live_slot_signers(slot))
 assert (warmed2, expected2)==(2,2)
 assert len(client.builds)==2
-print('PRE-JUMP v20.11 local-only per-token presign prewarm: OK')
+print('PRE-JUMP v20.12 local-only per-token presign prewarm: OK')

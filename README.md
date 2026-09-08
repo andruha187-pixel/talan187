@@ -1,4 +1,41 @@
-# v20.11 PRESIGN PREWARM — first FAK cold-start fix
+# v20.12 FAST EVENT TP — event-driven LIVE take profit
+
+Эта версия построена поверх v20.11 PRESIGN PREWARM. **ENTRY, SAFE-фильтры, score, slippage, размер и TP-цель не менялись.**
+
+Главное изменение: LIVE TAKE PROFIT больше не зависит только от 0.75-секундного polling. Пока у бота есть реальная LIVE-позиция, обновление **BID** её outcome-token через Polymarket WebSocket немедленно будит TP-проверку. Если по полной видимой глубине NET PnL уже >= текущего `TAKE_PROFIT_USDC`, SELL FAK готовится и отправляется сразу. Старый `TP_CHECK_INTERVAL=0.75` сохранён как fallback. PAPER TP остаётся прежним.
+
+Дополнительно:
+
+- event TP работает только для bot-tracked LIVE-позиций, поэтому чужие/пустые книги не создают лишнюю нагрузку;
+- timer и event TP сериализованы отдельным lock — два SELL не могут одновременно гоняться за одной позицией;
+- на TP SELL проверяется именно свежесть **bid-side**, а не ask-side, поэтому отсутствие/старость ask больше не вызывает лишний REST перед TP;
+- после LIVE BUY outcome-token автоматически ставится под BID-watch; после рестарта открытые LIVE-позиции восстанавливаются из SQLite;
+- `LIVE_TP_MIN_HOLD_MS` и безопасная обработка balance/allowance rejection из v20.11 сохранены;
+- Telegram у LIVE SELL/TP NO MATCH теперь показывает `path=book_event`, trigger bid/depth/projected PnL и `event→book`, `build/sign`, `event→submit`, `API`, `event→resp`; Telegram отправляется только после order call и не тормозит сам SELL.
+
+Рекомендуемые новые ENV:
+
+```env
+EVENT_DRIVEN_LIVE_TP=1
+LIVE_TP_EVENT_MIN_INTERVAL_MS=5
+TP_CHECK_INTERVAL=0.75
+LIVE_TP_MIN_HOLD_MS=2000
+LIVE_TP_BALANCE_RETRY_DELAY_MS=1000
+```
+
+Пример новой диагностики:
+
+```text
+🔴 LIVE SELL BTC
+TAKE_PROFIT Down: ...
+⏱ path=book_event | bid 0.7400 | depth 5.4310sh | projected $+0.63 | event→book 2ms | build/sign 5ms | event→submit 8ms | API 2xxms | event→resp ...
+```
+
+`TP_CHECK_INTERVAL=0.75` теперь страховка, а не основной быстрый путь.
+
+---
+
+## База v20.11 PRESIGN PREWARM — first FAK cold-start fix
 
 Эта версия построена поверх v20.10 ULTRA LOW LATENCY. **Стратегия и SAFE-фильтры не менялись.**
 Изменён только путь подготовки LIVE-ордера после того, как реальные логи показали:

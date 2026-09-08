@@ -47,7 +47,7 @@ load_dotenv()
 # Whole-position NET take-profit is configurable (default +$0.60).
 # ============================================================
 
-VERSION = "20.11-multi7-prejump-live-presign-prewarm"
+VERSION = "20.12-multi7-prejump-live-event-tp"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -154,9 +154,13 @@ ETH_PREJUMP_SCORE = max(PREJUMP_SCORE_MIN, min(PREJUMP_SCORE_MAX, ETH_PREJUMP_SC
 ETH_PREJUMP_PM_MOM_MAX = _safe_float_env("ETH_PREJUMP_PM_MOM_MAX", 0.02)
 ETH_PREJUMP_PM_MOM_MAX = max(PREJUMP_PM_MOM_MIN, min(PREJUMP_PM_MOM_MAX, ETH_PREJUMP_PM_MOM_MAX))
 
-# Runtime load controls: 100ms fallback scorer + event-driven LIVE entry, TP every 750ms.
+# Runtime load controls: 100ms fallback scorer + event-driven LIVE entry.
+# v20.12 also reacts to Polymarket BID book events for LIVE take-profit; the
+# 750ms timer remains a safety fallback and PAPER behavior is unchanged.
 EVENT_DRIVEN_LIVE_ENTRY = os.getenv("EVENT_DRIVEN_LIVE_ENTRY", "1").strip().lower() in {"1", "true", "yes", "on"}
 EVENT_DRIVEN_MIN_INTERVAL_MS = max(0, min(100, int(os.getenv("EVENT_DRIVEN_MIN_INTERVAL_MS", "5"))))
+EVENT_DRIVEN_LIVE_TP = os.getenv("EVENT_DRIVEN_LIVE_TP", "1").strip().lower() in {"1", "true", "yes", "on"}
+LIVE_TP_EVENT_MIN_INTERVAL_MS = max(0, min(100, int(os.getenv("LIVE_TP_EVENT_MIN_INTERVAL_MS", "5"))))
 TP_CHECK_INTERVAL = max(0.25, float(os.getenv("TP_CHECK_INTERVAL", "0.75")))
 TRAJECTORY_INTERVAL = max(1.0, float(os.getenv("TRAJECTORY_INTERVAL", "3.0")))
 
@@ -345,6 +349,17 @@ external_eval_received_ms = defaultdict(int)
 external_eval_last_run = defaultdict(float)
 prejump_eval_locks = defaultdict(asyncio.Lock)
 live_entry_latency = {}
+# Event-driven LIVE TP coordination. Only assets with a tracked LIVE position
+# are armed, so high-rate Polymarket WS traffic for unrelated markets never
+# causes SQLite/TP work. Per-position locks serialize timer and event paths.
+live_tp_eval_locks = defaultdict(asyncio.Lock)
+live_tp_watch_assets = set()
+live_tp_asset_events = defaultdict(asyncio.Event)
+live_tp_event_received_ms = defaultdict(int)
+live_tp_event_last_run = defaultdict(float)
+live_tp_asset_tasks = {}
+live_tp_asset_loops = {}
+live_tp_latency = {}
 source_health = defaultdict(lambda: defaultdict(lambda: {
     "connected": False, "last_ms": 0, "messages": 0, "errors": 0, "last_error": "",
 }))
@@ -1240,6 +1255,7 @@ def apply_book(asset, payload, source="ws"):
 def apply_price_change(payload):
     changes = payload.get("price_changes") or payload.get("priceChanges") or []
     recv = now_ms()
+    changed_assets = set()
     for ch in changes:
         if not isinstance(ch, dict):
             continue
@@ -1261,6 +1277,9 @@ def apply_price_change(payload):
             target[p] = q
         b["received_ms"] = recv
         b["source"] = "ws"
+        if side == "BUY":
+            changed_assets.add(asset)
+    return changed_assets
 
 
 def best_ask(asset):
@@ -1275,6 +1294,76 @@ def best_bid(asset):
     if not b or not b.get("bids"):
         return None
     return max(b["bids"])
+
+
+def _db_live_open_assets():
+    """Return token ids with unresolved LIVE shares still held by this bot."""
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                """SELECT lo.condition_id,lo.variant,lo.asset,
+                          SUM(CASE WHEN lo.action='BUY' THEN lo.filled_shares
+                                   WHEN lo.action='SELL' THEN -lo.filled_shares ELSE 0 END) AS remaining
+                   FROM live_orders lo
+                   WHERE lo.filled_shares>0
+                     AND NOT EXISTS (
+                         SELECT 1 FROM market_results mr
+                         WHERE mr.condition_id=lo.condition_id AND mr.variant=lo.variant
+                     )
+                   GROUP BY lo.condition_id,lo.variant,lo.asset
+                   HAVING remaining>0.00000001"""
+            ).fetchall()
+        return {str(r["asset"]) for r in rows if str(r["asset"] or "")}
+    except Exception:
+        return set()
+
+
+def arm_live_tp_asset(asset):
+    """Arm one token for event-driven TP without blocking the WS reader."""
+    asset = str(asset or "")
+    if not EVENT_DRIVEN_LIVE_TP or not asset:
+        return False
+    live_tp_watch_assets.add(asset)
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return True
+    # Tests/reloads can create more than one asyncio loop in one process.
+    # Production uses one loop, but rebinding here keeps the watcher robust.
+    if live_tp_asset_loops.get(asset) is not loop:
+        old_task = live_tp_asset_tasks.get(asset)
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+        live_tp_asset_events[asset] = asyncio.Event()
+        live_tp_asset_loops[asset] = loop
+        live_tp_asset_tasks[asset] = None
+    task = live_tp_asset_tasks.get(asset)
+    if task is None or task.done():
+        live_tp_asset_tasks[asset] = loop.create_task(event_driven_live_tp_asset_loop(asset))
+    return True
+
+
+def rebuild_live_tp_watch_assets():
+    for asset in _db_live_open_assets():
+        arm_live_tp_asset(asset)
+
+
+def notify_live_tp_book_event(asset, received_ms=None):
+    """Coalesce high-rate BID updates into one per-asset TP event."""
+    asset = str(asset or "")
+    if not EVENT_DRIVEN_LIVE_TP or not asset or asset not in live_tp_watch_assets:
+        return
+    live_tp_event_received_ms[asset] = si(received_ms, now_ms()) or now_ms()
+    live_tp_asset_events[asset].set()
+
+
+async def _wake_live_tp_after_hold(asset, delay_ms):
+    """Guarantee one TP re-check exactly after the post-BUY balance guard."""
+    try:
+        await asyncio.sleep(max(0, si(delay_ms)) / 1000.0)
+        notify_live_tp_book_event(asset, now_ms())
+    except asyncio.CancelledError:
+        raise
 
 
 async def refresh_book(asset):
@@ -1562,8 +1651,10 @@ async def ws_loop():
                                 asset = str(payload.get("asset_id") or payload.get("token_id") or "")
                                 if asset:
                                     apply_book(asset, payload)
+                                    notify_live_tp_book_event(asset, now_ms())
                             elif et == "price_change":
-                                apply_price_change(payload)
+                                for asset in apply_price_change(payload):
+                                    notify_live_tp_book_event(asset, now_ms())
                             elif et == "market_resolved":
                                 await settle_from_resolution(payload)
                 finally:
@@ -2702,10 +2793,12 @@ async def execute_paper_take_profit(market, variant, candidate, age, target):
     return True
 
 
-async def maybe_take_profit(market, variant, elapsed):
+async def _maybe_take_profit_inner(market, variant, elapsed, trigger_ms=None, evaluation_path="timer"):
     """Monitor PAPER/LIVE positions and close at current whole-position NET TP."""
     cid = market["condition_id"]
     name = variant["name"]
+    trigger_ms = si(trigger_ms, now_ms()) or now_ms()
+    evaluation_path = str(evaluation_path or "timer")
     st = get_variant_state(cid, variant)
     if not st["started_sides"] or st.get("take_profit_closed"):
         return False
@@ -2787,9 +2880,25 @@ async def maybe_take_profit(market, variant, elapsed):
     if now_ms() < si(live_tp_retry_after_ms.get(retry_key)):
         return False
 
+    # Snapshot the exact executable TP condition that triggered this attempt.
+    # Telegram/log diagnostics are emitted only AFTER the order call, so they add
+    # zero latency to the SELL path.
+    tp_ctx = {
+        "path": evaluation_path,
+        "signal_ms": trigger_ms,
+        "attempt_start_ms": now_ms(),
+        "trigger_bid": best_bid(pos["primary_asset"]),
+        "trigger_avg": (candidate.get("avg") if candidate else None),
+        "trigger_depth_shares": (candidate.get("filled") if candidate else None),
+        "projected_pnl": (candidate.get("total_pnl") if candidate else None),
+        "target": target,
+    }
+    live_tp_latency[(cid, name)] = tp_ctx
+
     result = await execute_live_fak(
         cid, variant, pos["primary_asset"], outcome,
         "TAKE_PROFIT", "SELL", remaining,
+        tp_trigger_ms=trigger_ms, tp_evaluation_path=evaluation_path,
     )
 
     filled = sf(result.get("filled"))
@@ -2833,6 +2942,15 @@ async def maybe_take_profit(market, variant, elapsed):
                 "TP is latched; bot will continue liquidation unless submission becomes ambiguous."
             )
     return True
+
+
+async def maybe_take_profit(market, variant, elapsed, trigger_ms=None, evaluation_path="timer"):
+    """Serialize timer/event TP checks so two real SELLs can never race."""
+    key = (market["condition_id"], variant["name"])
+    async with live_tp_eval_locks[key]:
+        return await _maybe_take_profit_inner(
+            market, variant, elapsed, trigger_ms=trigger_ms, evaluation_path=evaluation_path
+        )
 
 
 def is_definite_fak_no_match_error(exc):
@@ -3028,11 +3146,36 @@ def _entry_latency_line(condition, variant_name):
     return " | ".join(bits)
 
 
+def _tp_latency_line(condition, variant_name):
+    ctx = live_tp_latency.get((condition, variant_name)) or {}
+    bits = []
+    path = str(ctx.get("path") or "")
+    if path:
+        bits.append(f"path={path}")
+    if ctx.get("trigger_bid") is not None:
+        bits.append(f"bid {sf(ctx.get('trigger_bid')):.4f}")
+    if ctx.get("trigger_depth_shares") is not None:
+        bits.append(f"depth {sf(ctx.get('trigger_depth_shares')):.4f}sh")
+    if ctx.get("projected_pnl") is not None:
+        bits.append(f"projected ${sf(ctx.get('projected_pnl')):+.2f}")
+    if ctx.get("signal_to_book_ms") is not None:
+        bits.append(f"event→book {si(ctx.get('signal_to_book_ms'))}ms")
+    if ctx.get("build_sign_ms") is not None:
+        bits.append(f"build/sign {si(ctx.get('build_sign_ms'))}ms")
+    if ctx.get("signal_to_submit_ms") is not None:
+        bits.append(f"event→submit {si(ctx.get('signal_to_submit_ms'))}ms")
+    if ctx.get("api_response_ms") is not None:
+        bits.append(f"API {si(ctx.get('api_response_ms'))}ms")
+    if ctx.get("signal_to_response_ms") is not None:
+        bits.append(f"event→resp {si(ctx.get('signal_to_response_ms'))}ms")
+    return " | ".join(bits)
+
+
 async def execute_live_fak(
     condition, variant, asset, outcome, reason, action, wanted,
     reference_price=None, force_rest=False, signal_detected_ms=None,
     event_received_ms=None, evaluation_path=None, attempt_label=None,
-    ws_only=False,
+    ws_only=False, tp_trigger_ms=None, tp_evaluation_path=None,
 ):
     """Place an exact-share FAK order using a freshly checked visible book.
 
@@ -3068,6 +3211,22 @@ async def execute_live_fak(
             "presign_warm_ms": live_presign_warm_ms.get(str(asset)),
         }
         root.setdefault("attempts", []).append(latency_ctx)
+
+    tp_latency_ctx = None
+    if action == "SELL" and reason == "TAKE_PROFIT":
+        tp_trigger_ms = si(tp_trigger_ms, now_ms()) or now_ms()
+        key = (condition, name)
+        tp_latency_ctx = live_tp_latency.get(key) or {}
+        tp_latency_ctx.update({
+            "path": str(tp_evaluation_path or tp_latency_ctx.get("path") or "timer"),
+            "signal_ms": tp_trigger_ms,
+            "attempt_start_ms": now_ms(),
+            "presign_warmed": str(asset) in live_presign_warmed_assets,
+            "presign_warm_ms": live_presign_warm_ms.get(str(asset)),
+        })
+        live_tp_latency[key] = tp_latency_ctx
+
+    timing_contexts = [x for x in (latency_ctx, tp_latency_ctx) if x is not None]
 
     if not LIVE_MASTER_ENABLE:
         log.error("LIVE BLOCK %s: LIVE_MASTER_ENABLE=0", name)
@@ -3106,13 +3265,17 @@ async def execute_live_fak(
                 age0 = now_ms() - si(b0.get("received_ms")) if b0.get("received_ms") else 999999
                 if not b0.get("asks") or age0 > MAX_BOOK_AGE_MS:
                     await ensure_book(asset)
+        elif action == "SELL" and reason == "TAKE_PROFIT":
+            # v20.12: TP is driven by BID liquidity. Never refresh just because
+            # the ask side is absent/stale; that would add an unnecessary REST RTT.
+            await ensure_sell_book(asset)
         else:
             await ensure_book(asset)
 
-        if latency_ctx is not None:
-            latency_ctx["book_ready_ms"] = now_ms()
-            latency_ctx["signal_to_book_ms"] = max(0, latency_ctx["book_ready_ms"] - latency_ctx["signal_ms"])
-            latency_ctx["attempt_to_book_ms"] = max(0, latency_ctx["book_ready_ms"] - latency_ctx["attempt_start_ms"])
+        for _ctx in timing_contexts:
+            _ctx["book_ready_ms"] = now_ms()
+            _ctx["signal_to_book_ms"] = max(0, _ctx["book_ready_ms"] - _ctx["signal_ms"])
+            _ctx["attempt_to_book_ms"] = max(0, _ctx["book_ready_ms"] - _ctx["attempt_start_ms"])
 
         if action == "BUY" and reason == "ENTRY":
             best_now = best_ask(asset)
@@ -3154,8 +3317,8 @@ async def execute_live_fak(
 
         # Stage 1: build/sign locally. Any exception here is definitely BEFORE
         # submission, therefore it is safe and must never be marked AMBIGUOUS.
-        if latency_ctx is not None:
-            latency_ctx["build_start_ms"] = now_ms()
+        for _ctx in timing_contexts:
+            _ctx["build_start_ms"] = now_ms()
         try:
             signed = await live_client.create_limit_order(
                 token_id=str(asset),
@@ -3165,9 +3328,9 @@ async def execute_live_fak(
                 post_only=False,
             )
             fak_order = replace(signed, order_type="FAK", post_only=False)
-            if latency_ctx is not None:
-                latency_ctx["build_end_ms"] = now_ms()
-                latency_ctx["build_sign_ms"] = max(0, latency_ctx["build_end_ms"] - latency_ctx.get("build_start_ms", latency_ctx["build_end_ms"]))
+            for _ctx in timing_contexts:
+                _ctx["build_end_ms"] = now_ms()
+                _ctx["build_sign_ms"] = max(0, _ctx["build_end_ms"] - _ctx.get("build_start_ms", _ctx["build_end_ms"]))
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             with db() as conn:
@@ -3203,10 +3366,10 @@ async def execute_live_fak(
         # Stage 2: from this point onward a submission may occur. Unknown transport
         # failures stay fail-closed; only deterministic FAK NO_MATCH is retry-safe.
         try:
-            if latency_ctx is not None:
-                latency_ctx["submit_ms"] = now_ms()
-                latency_ctx["signal_to_submit_ms"] = max(0, latency_ctx["submit_ms"] - latency_ctx["signal_ms"])
-                latency_ctx["attempt_to_submit_ms"] = max(0, latency_ctx["submit_ms"] - latency_ctx["attempt_start_ms"])
+            for _ctx in timing_contexts:
+                _ctx["submit_ms"] = now_ms()
+                _ctx["signal_to_submit_ms"] = max(0, _ctx["submit_ms"] - _ctx["signal_ms"])
+                _ctx["attempt_to_submit_ms"] = max(0, _ctx["submit_ms"] - _ctx["attempt_start_ms"])
             submitted = now_ms()
             if sdk_post_order_with_allowance_recovery is not None:
                 response = await sdk_post_order_with_allowance_recovery(live_client, fak_order)
@@ -3215,11 +3378,11 @@ async def execute_live_fak(
                 # that provides allowance-recovery placement.
                 response = await live_client.post_order(fak_order)
 
-            if latency_ctx is not None:
-                latency_ctx["response_ms"] = now_ms()
-                latency_ctx["api_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx.get("submit_ms", latency_ctx["response_ms"]))
-                latency_ctx["signal_to_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["signal_ms"])
-                latency_ctx["attempt_to_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["attempt_start_ms"])
+            for _ctx in timing_contexts:
+                _ctx["response_ms"] = now_ms()
+                _ctx["api_response_ms"] = max(0, _ctx["response_ms"] - _ctx.get("submit_ms", _ctx["response_ms"]))
+                _ctx["signal_to_response_ms"] = max(0, _ctx["response_ms"] - _ctx["signal_ms"])
+                _ctx["attempt_to_response_ms"] = max(0, _ctx["response_ms"] - _ctx["attempt_start_ms"])
 
             ok = bool(getattr(response, "ok", False))
             if not ok:
@@ -3306,6 +3469,10 @@ async def execute_live_fak(
                 st["started_sides"].add(asset)
                 if st["primary_asset"] is None:
                     st["primary_asset"] = asset
+                # Start watching this exact outcome token's BID immediately.
+                arm_live_tp_asset(asset)
+                if EVENT_DRIVEN_LIVE_TP and LIVE_TP_MIN_HOLD_MS > 0:
+                    asyncio.create_task(_wake_live_tp_after_hold(asset, LIVE_TP_MIN_HOLD_MS))
 
             if filled > 1e-9:
                 log.warning(
@@ -3313,7 +3480,11 @@ async def execute_live_fak(
                     action, name, reason, outcome, filled, avg, limit_price, status,
                 )
                 if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                    timing = _entry_latency_line(condition, name) if action == "BUY" and reason == "ENTRY" else ""
+                    timing = (
+                        _entry_latency_line(condition, name) if action == "BUY" and reason == "ENTRY"
+                        else _tp_latency_line(condition, name) if action == "SELL" and reason == "TAKE_PROFIT"
+                        else ""
+                    )
                     await tg_send(
                         f"🔴 LIVE {action} {symbol}\n"
                         f"{reason} {outcome}: {filled:.4f}sh @ {avg:.4f}\n"
@@ -3333,11 +3504,13 @@ async def execute_live_fak(
 
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
-            if latency_ctx is not None and latency_ctx.get("submit_ms") is not None:
-                latency_ctx["response_ms"] = now_ms()
-                latency_ctx["api_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["submit_ms"])
-                latency_ctx["signal_to_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["signal_ms"])
-                latency_ctx["attempt_to_response_ms"] = max(0, latency_ctx["response_ms"] - latency_ctx["attempt_start_ms"])
+            for _ctx in timing_contexts:
+                if _ctx.get("submit_ms") is None:
+                    continue
+                _ctx["response_ms"] = now_ms()
+                _ctx["api_response_ms"] = max(0, _ctx["response_ms"] - _ctx["submit_ms"])
+                _ctx["signal_to_response_ms"] = max(0, _ctx["response_ms"] - _ctx["signal_ms"])
+                _ctx["attempt_to_response_ms"] = max(0, _ctx["response_ms"] - _ctx["attempt_start_ms"])
 
             # IMPORTANT: a FAK "no orders found to match" rejection is a
             # deterministic zero-fill/kill, not an ambiguous submission. Record
@@ -3405,9 +3578,10 @@ async def execute_live_fak(
                     await tg_send(
                         f"⏳ LIVE TP NO MATCH {symbol} / {variant['code']}\n"
                         f"SELL TAKE_PROFIT {outcome}: 0sh filled.\n"
-                        "FAK was killed with no match, so this is NOT treated as ambiguous.\n"
-                        "Bot will retry on later TP cycles only while the current NET TP "
-                        "condition is still satisfied."
+                        + (f"⏱ {_tp_latency_line(condition, name)}\n" if _tp_latency_line(condition, name) else "")
+                        + "FAK was killed with no match, so this is NOT treated as ambiguous.\n"
+                        "Bot will retry on the next BID event or fallback TP cycle only while "
+                        "the current NET TP condition is still satisfied."
                     )
                 return {
                     "ok": False,
@@ -3963,8 +4137,54 @@ async def event_driven_symbol_loop(symbol):
             log.exception("event-driven PRE-JUMP evaluator failed | %s", symbol)
 
 
+async def _event_driven_live_tp_asset_once(asset, trigger_ms):
+    """Recalculate LIVE TP immediately from a Polymarket BID book event."""
+    if not EVENT_DRIVEN_LIVE_TP or asset not in live_tp_watch_assets:
+        return False
+    t_s = time.time()
+    checked = False
+    for market in list(markets.values()):
+        if asset not in {str(market.get("up_asset") or ""), str(market.get("down_asset") or "")}:
+            continue
+        elapsed = t_s - sf(market.get("start_ts"))
+        if not (-2 <= elapsed <= 305):
+            continue
+        for variant in strategies_for_market(market):
+            pos = position_totals(market["condition_id"], variant["name"])
+            if (pos.get("execution_mode") or "").upper() != "LIVE":
+                continue
+            if str(pos.get("primary_asset") or "") != str(asset) or pos.get("remaining", 0) <= 1e-8:
+                continue
+            checked = True
+            await maybe_take_profit(
+                market, variant, elapsed, trigger_ms=trigger_ms, evaluation_path="book_event"
+            )
+    return checked
+
+
+async def event_driven_live_tp_asset_loop(asset):
+    """One coalescing event consumer per LIVE-held outcome token."""
+    ev = live_tp_asset_events[asset]
+    while True:
+        await ev.wait()
+        ev.clear()
+        try:
+            if LIVE_TP_EVENT_MIN_INTERVAL_MS:
+                elapsed_ms = (time.monotonic() - live_tp_event_last_run[asset]) * 1000.0
+                wait_ms = LIVE_TP_EVENT_MIN_INTERVAL_MS - elapsed_ms
+                if wait_ms > 0:
+                    await asyncio.sleep(wait_ms / 1000.0)
+            trigger_ms = live_tp_event_received_ms.get(asset) or now_ms()
+            await _event_driven_live_tp_asset_once(asset, trigger_ms)
+            live_tp_event_last_run[asset] = time.monotonic()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("event-driven LIVE TP evaluator failed | asset=%s", asset)
+
+
 async def strategy_loop():
-    """100ms fallback scorer + PAPER path; event-driven loop handles LIVE first."""
+    """100ms fallback scorer + PAPER path; event-driven loops handle LIVE first."""
     while True:
         started = time.monotonic()
         t_s = time.time()
@@ -4861,6 +5081,13 @@ async def health(request):
             },
         },
         "take_profit_usdc_net": take_profit_usdc(),
+        "live_tp": {
+            "event_driven": EVENT_DRIVEN_LIVE_TP,
+            "event_min_interval_ms": LIVE_TP_EVENT_MIN_INTERVAL_MS,
+            "timer_fallback_sec": TP_CHECK_INTERVAL,
+            "min_hold_ms": LIVE_TP_MIN_HOLD_MS,
+            "watched_assets": len(live_tp_watch_assets),
+        },
         "modes": {v["symbol"]: strategy_mode(v["name"]) for v in STRATEGIES},
         "entry_shares": {v["symbol"]: entry_shares(v) for v in STRATEGIES},
         "sources": source_status,
@@ -4886,6 +5113,7 @@ async def web_server():
 async def main():
     global session
     init_db()
+    rebuild_live_tp_watch_assets()
     session = aiohttp.ClientSession(headers={
         "User-Agent": f"PreJumpPaperLive/{VERSION}",
         "Accept": "application/json",
@@ -4918,9 +5146,10 @@ async def main():
 
     log.info(
         "%s started | symbols=%s | score>=%.2f | window=%.0f..%.0fs | fast=%.2fs | "
-        "event_live=%s/%dms | slippage=%.2f | retry=%d/%dms/rest=%s | transport_prewarm=%s/%.0fs | presign_prewarm=%s/%.0fs | TP=%s | live_master=%s | wallet=%s | trading=%s",
+        "event_live=%s/%dms | event_tp=%s/%dms fallback=%.2fs | slippage=%.2f | retry=%d/%dms/rest=%s | transport_prewarm=%s/%.0fs | presign_prewarm=%s/%.0fs | TP=%s | live_master=%s | wallet=%s | trading=%s",
         VERSION, ",".join(SYMBOLS), prejump_score(), PREJUMP_MIN_ELAPSED, PREJUMP_MAX_ELAPSED,
         FAST_INTERVAL, "ON" if EVENT_DRIVEN_LIVE_ENTRY else "OFF", EVENT_DRIVEN_MIN_INTERVAL_MS,
+        "ON" if EVENT_DRIVEN_LIVE_TP else "OFF", LIVE_TP_EVENT_MIN_INTERVAL_MS, TP_CHECK_INTERVAL,
         LIVE_ENTRY_MAX_SLIPPAGE, LIVE_ENTRY_NO_MATCH_RETRIES, LIVE_ENTRY_RETRY_DELAY_MS,
         "ON" if LIVE_ENTRY_RETRY_FORCE_REST else "OFF",
         "ON" if LIVE_PREWARM_ENABLE else "OFF", LIVE_PREWARM_INTERVAL_SEC,

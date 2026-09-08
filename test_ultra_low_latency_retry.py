@@ -15,7 +15,7 @@ os.environ['LIVE_PREWARM_ENABLE']='0'
 
 spec=importlib.util.spec_from_file_location('bot', os.path.join(os.path.dirname(__file__),'main.py'))
 bot=importlib.util.module_from_spec(spec); spec.loader.exec_module(bot); bot.init_db()
-assert bot.VERSION.startswith('20.11-')
+assert bot.VERSION.startswith('20.12-')
 V=bot.STRATEGIES_BY_SYMBOL['DOGE'][0]
 bot.state_set(f"mode:{V['name']}", 'LIVE')
 bot.LIVE_MASTER_ENABLE=True
@@ -61,4 +61,4 @@ ctx=bot.live_entry_latency[(cid,V['name'])]
 assert len(ctx.get('attempts') or []) == 2, ctx
 assert ctx['attempts'][0]['label'] == 'first'
 assert ctx['attempts'][1]['label'] == 'retry1'
-print('PRE-JUMP v20.11 immediate WS NO_MATCH retry: OK')
+print('PRE-JUMP v20.12 immediate WS NO_MATCH retry: OK')
