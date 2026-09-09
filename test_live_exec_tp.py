@@ -45,4 +45,4 @@ async def run():
     assert any(x[0]=='SELL' for x in bot.live_client.posts), bot.live_client.posts
     assert 'path=book_event' in bot._tp_latency_line(cid,V['name'])
 asyncio.run(run())
-print('v20.13 LIVE cap + event TP regression: OK')
+print('v20.14 LIVE cap + event TP regression: OK')

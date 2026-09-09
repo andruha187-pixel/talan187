@@ -1,0 +1,27 @@
+PRE-JUMP v20.14 final regression run
+UTC: 2026-09-09T07:50:16Z
+
+PASS: python -m py_compile main.py
+PASS: test_v2014_candidates.py
+PASS: test_paper_live_sim.py
+PASS: test_plc_confirm_entry.py
+PASS: test_hourly_report.py
+PASS: test_tick_alignment.py
+PASS: test_live_exec_tp.py
+PASS: test_tp_balance_sync.py
+PASS: test_prewarm.py
+PASS: test_presign_prewarm.py
+
+Coverage highlights:
+- 21 branches = 7 tokens x PJM03/PJS/PLC
+- default NET TP 1.05; Telegram TP step 0.05
+- token-specific SAFE filters + PJM03 <= +0.03
+- PLC confirmation -> delayed PAPER execution
+- PAPER ENTRY live-like full-size/slippage behavior
+- PAPER TP delayed NO_MATCH does not create fake profit
+- one LIVE branch per token
+- 0.01 tick alignment/local-reject non-ambiguity
+- FAST EVENT LIVE TP
+- BTC balance/allowance propagation retry + migration
+- transport/presign prewarm does not submit orders
+- hourly ZIP includes separate candidate result files

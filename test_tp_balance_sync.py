@@ -10,7 +10,7 @@ os.environ['PREJUMP_SCORE']='0.40'
 os.environ['TAKE_PROFIT_USDC']='0.60'
 spec=importlib.util.spec_from_file_location('bot',os.path.join(os.path.dirname(__file__),'main.py'))
 bot=importlib.util.module_from_spec(spec); spec.loader.exec_module(bot); bot.init_db()
-assert bot.VERSION.startswith('20.13-')
+assert bot.VERSION.startswith('20.14-')
 V=bot.STRATEGIES_BY_SYMBOL['BTC'][0]
 bot.state_set(f"mode:{V['name']}",'LIVE')
 bot.LIVE_MASTER_ENABLE=True; bot.live_client_ready=True; bot.sdk_post_order_with_allowance_recovery=None

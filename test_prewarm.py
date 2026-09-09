@@ -10,7 +10,7 @@ os.environ['LIVE_PREWARM_INTERVAL_SEC']='15'
 
 spec=importlib.util.spec_from_file_location('bot', os.path.join(os.path.dirname(__file__),'main.py'))
 bot=importlib.util.module_from_spec(spec); spec.loader.exec_module(bot); bot.init_db()
-assert bot.VERSION.startswith('20.13-')
+assert bot.VERSION.startswith('20.14-')
 
 class Balance:
     balance='1000000'
@@ -26,4 +26,4 @@ assert ok and client.calls==1
 # Cooldown prevents an immediate second request.
 ok2=asyncio.run(bot.prewarm_live_transport('test2'))
 assert not ok2 and client.calls==1
-print('PRE-JUMP v20.12 read-only SDK transport prewarm: OK')
+print('PRE-JUMP v20.14 read-only SDK transport prewarm: OK')

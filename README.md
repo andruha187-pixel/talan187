@@ -1,73 +1,84 @@
-# v20.13 PRE_LEAD_SAFE LIVE
+# PRE-JUMP v20.14 — PJM03 / PJS / PLC
 
-Real-money-capable PRE_LEAD_SAFE build based on v20.12 low-latency execution and event-driven TP.
+Version: `20.14-multi7-pjm03-pjs-plc-paper-live`
 
-## What changed
+This build forward-tests three independent candidates on each configured 5-minute crypto token:
 
-Only one entry strategy is active per token: `PRE_LEAD_SAFE`.
+- `PJM03` — first PRE-JUMP >= 0.40, token-specific SAFE overlay, plus PM momentum <= +0.03.
+- `PJS` — same first PRE-JUMP and token-specific SAFE overlay, without the new +0.03 filter.
+- `PLC` — first PRE_LEAD_SAFE candidate, then a 125 ms confirmation before execution.
 
-Validated signal family kept from the paper lab:
+Default size is **5 shares** and whole-position NET TP is **+$1.05**. Fresh databases start with every branch in PAPER, global entries OFF, and no real order can be sent until LIVE is explicitly enabled and confirmed.
 
-- directional external score `0.34 <= score < 0.40`;
-- score rises at least `+0.015` over approximately 300 ms;
-- 300 ms projected score `>= 0.55`;
-- at least 2 fresh same-direction venues;
-- Polymarket signal ask `0.52..0.56`;
-- 1 s PM ask momentum `-0.01..+0.05`;
-- elapsed `1..160 s`.
+## PAPER live-like model
 
-The dedicated lab simulated Polymarket execution by waiting ~250 ms before an entry. **LIVE does not add another 250 ms sleep.** It submits the first FAK immediately after the validated early signal; the purpose of PRE_LEAD_SAFE is to reach Polymarket before the move while its own taker-order handling occurs.
+PJM03/PJS accepted signals wait 250 ms before the simulated FAK. PLC waits 125 ms for confirmation and then pays the same 250 ms simulated execution delay. The full requested size must still be visible no worse than the accepted ask +0.05; otherwise the attempt is NO FILL.
 
-The signal itself remains on the same 100 ms evaluation cadence used by the forward test. The old `EVENT_DRIVEN_LIVE_ENTRY` environment variable is intentionally ignored in v20.13 so the signal population does not silently change.
+PAPER TP waits at least 2 seconds after BUY. When the NET target first becomes executable it freezes the actual sell limit, waits 250 ms, and only fills if the whole remaining size can still sell at that limit or better. NO_MATCH does not create PnL.
 
-## Entry execution
+## LIVE safety and execution
 
-- default 5 shares;
-- hard execution cap = signal ask + `LIVE_ENTRY_MAX_SLIPPAGE` (default +0.05), never above the PRE_LEAD execution band max 0.66;
-- presign prewarm is retained, so the real signal should normally avoid the old ~250 ms cold build/sign cost;
-- `PRELEAD_LIVE_NO_MATCH_RETRIES=0` by default: one actual FAK attempt, closest to the paper live-sim methodology;
-- ambiguous submissions remain fail-closed.
+LIVE keeps the v20.12/v20.13 prewarm/presign, signed LIMIT -> FAK path, deterministic NO_MATCH handling, fail-closed ambiguous submission handling, and FAST EVENT TP. v20.14 also hard-blocks two strategies from being LIVE on the same token at once.
 
-## Take profit
+The LIVE price normalizer never uses a tick finer than `LIVE_PRICE_TICK_FALLBACK=0.01`, preventing the ETH-style SDK rejection caused by three-decimal prices when the market accepts only 0.01 ticks.
 
-Default ENV target is **+$0.90 NET for the whole remaining position**.
+The BTC post-BUY TP propagation fix is retained: LIVE TP waits 2 seconds by default; an explicit not-enough-balance/allowance rejection is classified as `REJECTED_BALANCE_ALLOWANCE` rather than ambiguous, and later TP cycles may retry safely. The startup migration also repairs old poisoned TP balance-rejection records.
 
-LIVE TP remains event-driven from v20.12: PM BID updates immediately recalculate executable whole-position NET PnL and submit SELL FAK when the configured target is available. The 0.75 s loop is fallback only.
+Start with `LIVE_MASTER_ENABLE=0`. Verify `WALLET` reports READY before deliberately enabling LIVE.
 
-Telegram controls:
+## Telegram essentials
 
-- `TAKE PROFIT` — show current TP;
-- `TP 0.90` — exact value;
-- `TP 1.00` — example alternative;
-- `➖ TP` / `➕ TP` — change by $0.10;
-- `TP OFF` / `TP ENV`.
+`START` / `STOP` control new entries globally.
 
-If `/var/data` already contains state from v20.12, the persisted TP can override the `.env` default. **After deployment, press TAKE PROFIT or send `TP 0.90` explicitly.**
+Examples:
 
-`LIVE_TP_MIN_HOLD_MS=2000` is retained because a newly bought outcome-token balance/allowance can take time to become sellable. This can delay a TP during the first 2 seconds after a fill, but avoids the balance/allowance rejection already observed in LIVE.
+```text
+MODE BTC PJM03 PAPER
+MODE BTC PJM03 LIVE
+CONFIRM LIVE BTC PJM03
+MODE BTC PJS PAPER
+MODE BTC PLC PAPER
+SIZE BTC 5
+SIZE ETH PLC 5
+TP 1.05
+TP OFF
+TP ENV
+MODES
+SIZES
+POSITIONS
+STATISTICS
+TRADES
+WALLET
+```
 
-## One-time v20.13 safety migration
+`SIZE BTC 5` sets all three BTC candidates to 5 shares. `SIZE BTC PLC 5` changes only PLC. PAPER candidates may run simultaneously; only one candidate per token may be LIVE.
 
-Because the entry strategy changed from PRE_JUMP to PRE_LEAD_SAFE, the first v20.13 boot intentionally:
+## Persistent data
 
-- sets global new entries to STOPPED;
-- sets every flat token mode to OFF;
-- preserves already-open v20.12 positions so their TP/settlement can continue to be tracked;
-- does not touch wallet credentials.
+Mount persistent storage at `/var/data`.
 
-This prevents an old armed LIVE mode from automatically trading a new signal family.
+- SQLite: `/var/data/prejump_v20_14_candidates.db`
+- hourly report directory: `/var/data/prejump_v20_14_reports`
 
-## Recommended first deployment
+Hourly Telegram ZIPs contain separate `results_PJM03.csv`, `results_PJS.csv`, and `results_PLC.csv`, plus gates, accepted signals, PLC confirmation checks, PAPER trades/exits, LIVE orders, and `summary.txt`.
 
-1. Deploy and wait for `WALLET` to report READY.
-2. Check `TAKE PROFIT`; send `TP 0.90` if that is the test target.
-3. Check `MODES`.
-4. Arm only the token(s) you want, for example `MODE BTC LIVE`, then `CONFIRM LIVE BTC` within 60 s.
-5. Keep `SIZE ... 5` for the first real-money forward sample.
-6. Press `START` only after modes and TP are correct.
+## Coolify
 
-No filter or TP value guarantees profit. The latest PRE_LEAD_SAFE sample was promising, but earlier forward periods were much weaker, so treat the first live run as a small-size validation rather than scaling size from the paper PnL.
+Use the included Dockerfile. Application port is `8080`; health endpoint is `/health`. Copy `.env.example` variables into Coolify Environment and keep the private key out of GitHub.
 
-## Persistent compatibility
+## Regression checks
 
-The internal strategy key remains `BTC_PRE_JUMP`, `ETH_PRE_JUMP`, etc. on purpose. This lets v20.13 read existing v20.12 positions from the same SQLite DB while the user-visible strategy is `PRE-LEAD-SAFE`.
+From the package directory:
+
+```bash
+python -m py_compile main.py
+python test_v2014_candidates.py
+python test_paper_live_sim.py
+python test_plc_confirm_entry.py
+python test_hourly_report.py
+python test_tick_alignment.py
+python test_live_exec_tp.py
+python test_tp_balance_sync.py
+python test_prewarm.py
+python test_presign_prewarm.py
+```
