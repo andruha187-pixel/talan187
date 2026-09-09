@@ -12,7 +12,7 @@ os.environ['LIVE_PREWARM_ENABLE']='0'
 
 spec=importlib.util.spec_from_file_location('bot', os.path.join(os.path.dirname(__file__),'main.py'))
 bot=importlib.util.module_from_spec(spec); spec.loader.exec_module(bot); bot.init_db()
-assert bot.VERSION.startswith('20.12-')
+assert bot.VERSION.startswith('20.13-')
 
 V=bot.STRATEGIES_BY_SYMBOL['BTC'][0]
 bot.state_set(f"mode:{V['name']}", 'LIVE')

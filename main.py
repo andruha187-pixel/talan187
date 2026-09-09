@@ -34,20 +34,21 @@ except ImportError:
 load_dotenv()
 
 # ============================================================
-# MULTI7 PRE-JUMP — PAPER + LIVE
-# v20.11 adds local-only per-token create/sign prewarm for upcoming LIVE markets.
+# MULTI7 PRE-LEAD-SAFE — PAPER + LIVE
+# v20.13 ports the forward-tested PRE_LEAD_SAFE signal into the low-latency LIVE engine.
 # ============================================================
-# Signal copied from the forward-tested PRE-JUMP lab:
-#   external composite score >= runtime threshold (default 0.40)
-#   >= 2 same-direction fresh venue votes
-#   Polymarket ask 0.52..0.66
+# LIVE entry copied from the forward-tested PRE_LEAD_SAFE lab:
+#   directional score 0.34..<0.40, rising by >=0.015 over ~300ms
+#   300ms projection >=0.55
+#   >=2 same-direction fresh venue votes
+#   Polymarket signal ask 0.52..0.56 (execution hard band remains <=0.66)
 #   1-second Polymarket ask momentum -0.01..+0.05
 #   elapsed 1..160 seconds
 # One ENTRY per token/5-minute market. No DCA. No stop-loss.
-# Whole-position NET take-profit is configurable (default +$0.60).
+# Whole-position NET take-profit is configurable (default +$0.90).
 # ============================================================
 
-VERSION = "20.12-multi7-prejump-live-event-tp"
+VERSION = "20.13-multi7-prelead-safe-live"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -102,6 +103,30 @@ PREJUMP_PM_MOM_MAX = float(os.getenv("PREJUMP_PM_MOM_MAX", "0.05"))
 PREJUMP_REQUIRE_BINANCE_BYBIT = os.getenv(
     "PREJUMP_REQUIRE_BINANCE_BYBIT", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+
+# PRE_LEAD_SAFE v1.7 forward-test parameters. These are intentionally frozen by
+# default so LIVE uses the same early-signal family that was tested in PAPER.
+PRELEAD_MIN_SCORE = max(0.0, float(os.getenv("PRELEAD_MIN_SCORE", "0.34")))
+PRELEAD_TARGET_SCORE = max(PRELEAD_MIN_SCORE + 1e-6, float(os.getenv("PRELEAD_TARGET_SCORE", "0.40")))
+PRELEAD_LOOKBACK_MS = max(100, int(os.getenv("PRELEAD_LOOKBACK_MS", "300")))
+PRELEAD_HORIZON_MS = max(100, int(os.getenv("PRELEAD_HORIZON_MS", "300")))
+PRELEAD_MIN_DELTA = max(0.0, float(os.getenv("PRELEAD_MIN_DELTA", "0.015")))
+PRELEAD_HISTORY_TOLERANCE_MS = max(50, int(os.getenv("PRELEAD_HISTORY_TOLERANCE_MS", "180")))
+PRELEAD_MIN_VENUES = max(1, int(os.getenv("PRELEAD_MIN_VENUES", "2")))
+PRELEAD_MIN_ELAPSED = float(os.getenv("PRELEAD_MIN_ELAPSED", "1"))
+PRELEAD_MAX_ELAPSED = float(os.getenv("PRELEAD_MAX_ELAPSED", "160"))
+PRELEAD_PRICE_MIN = max(0.01, float(os.getenv("PRELEAD_PRICE_MIN", "0.52")))
+PRELEAD_PRICE_MAX = min(0.99, max(PRELEAD_PRICE_MIN, float(os.getenv("PRELEAD_PRICE_MAX", "0.66"))))
+PRELEAD_PM_MOM_MIN = float(os.getenv("PRELEAD_PM_MOM_MIN", "-0.01"))
+PRELEAD_PM_MOM_MAX = float(os.getenv("PRELEAD_PM_MOM_MAX", "0.05"))
+PRELEAD_SAFE_PROJECTED_SCORE = max(PRELEAD_TARGET_SCORE, min(1.0, float(os.getenv("PRELEAD_SAFE_PROJECTED_SCORE", "0.55"))))
+PRELEAD_SAFE_PRICE_MAX = max(PRELEAD_PRICE_MIN, min(PRELEAD_PRICE_MAX, float(os.getenv("PRELEAD_SAFE_PRICE_MAX", "0.56"))))
+# The lab simulated Polymarket's taker hold by waiting 250ms before PAPER fill.
+# LIVE must NOT sleep here: submit immediately and let Polymarket apply its own delay.
+PRELEAD_PAPER_SIM_DELAY_MS = max(0, int(os.getenv("PRELEAD_PAPER_SIM_DELAY_MS", "250")))
+# Entry evaluation stays on the same 100ms cadence used by the forward test.
+# The old EVENT_DRIVEN_LIVE_ENTRY env is deliberately ignored for PRE_LEAD_SAFE.
+PRELEAD_EVENT_DRIVEN_ENTRY = False
 
 # BTC-only first-signal quality filter. IMPORTANT: this is intentionally applied
 # *after* the normal PRE-JUMP 0.40 family has produced its first otherwise-valid
@@ -182,18 +207,21 @@ MEMORY_LOG_INTERVAL = int(os.getenv("MEMORY_LOG_INTERVAL", "300"))
 
 
 def _take_profit_from_env():
-    raw = os.getenv("TAKE_PROFIT_USDC", "0.60").strip()
+    raw = os.getenv("TAKE_PROFIT_USDC", "0.90").strip()
     if raw.upper() in {"OFF", "NONE", "DISABLED"}:
         return None
     try:
         value = float(raw.replace(",", "."))
     except (TypeError, ValueError):
-        return 0.60
+        return 0.90
     return value if value > 0 else None
 
 
 TAKE_PROFIT_USDC = _take_profit_from_env()
 TAKE_PROFIT_RUNTIME_USDC = TAKE_PROFIT_USDC
+TAKE_PROFIT_MIN_USDC = max(0.05, float(os.getenv("TAKE_PROFIT_MIN_USDC", "0.10")))
+TAKE_PROFIT_MAX_USDC = max(TAKE_PROFIT_MIN_USDC, float(os.getenv("TAKE_PROFIT_MAX_USDC", "2.00")))
+TAKE_PROFIT_STEP_USDC = max(0.01, float(os.getenv("TAKE_PROFIT_STEP_USDC", "0.10")))
 
 # LIVE safety gates. A real order needs BOTH master=1 and a confirmed token mode=LIVE.
 LIVE_MASTER_ENABLE = os.getenv("LIVE_MASTER_ENABLE", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -214,6 +242,7 @@ LIVE_MIN_SHARES = float(os.getenv("LIVE_MIN_SHARES", "0.01"))
 # immediately from the latest WS book; REST retry is opt-in only.
 LIVE_ENTRY_MAX_SLIPPAGE = max(0.0, float(os.getenv("LIVE_ENTRY_MAX_SLIPPAGE", "0.05")))
 LIVE_ENTRY_NO_MATCH_RETRIES = max(0, min(2, int(os.getenv("LIVE_ENTRY_NO_MATCH_RETRIES", "1"))))
+PRELEAD_LIVE_NO_MATCH_RETRIES = max(0, min(1, int(os.getenv("PRELEAD_LIVE_NO_MATCH_RETRIES", "0"))))
 LIVE_ENTRY_RETRY_DELAY_MS = max(0, min(1000, int(os.getenv("LIVE_ENTRY_RETRY_DELAY_MS", "0"))))
 LIVE_ENTRY_RETRY_FORCE_REST = os.getenv(
     "LIVE_ENTRY_RETRY_FORCE_REST", "0"
@@ -283,9 +312,10 @@ CONSENSUS_MIN_OTHER_TOKENS = 2
 def _strategy_set(symbol):
     return [{
         "symbol": symbol,
-        "code": "PJ",
+        "code": "PLS",
+        # Keep legacy persistent name so v20.12 open positions/modes/sizes survive upgrade.
         "name": f"{symbol}_PRE_JUMP",
-        "short": f"{symbol} / PRE-JUMP",
+        "short": f"{symbol} / PRE-LEAD-SAFE",
         "max_buys_side": 1,
         "dca_enabled": False,
         "consensus_enabled": False,
@@ -342,6 +372,8 @@ venue_trade_buckets = defaultdict(lambda: defaultdict(lambda: deque(maxlen=600))
 venue_liq_buckets = defaultdict(lambda: defaultdict(lambda: deque(maxlen=120)))
 venue_sample_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=256)))
 feature_history = defaultdict(lambda: deque(maxlen=512))
+lead_feature_history = defaultdict(lambda: deque(maxlen=256))
+lead_pm_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=512)))
 # Event-driven LIVE-entry coordination. The timer loop remains as a 100ms fallback
 # and keeps PAPER behavior unchanged. A per-market lock prevents timer/event races.
 external_eval_events = {symbol: asyncio.Event() for symbol in SYMBOLS}
@@ -3033,7 +3065,7 @@ def _entry_price_cap(reference_ask):
     """Maximum LIVE BUY price allowed from the original accepted signal ask."""
     if reference_ask is None:
         return None
-    return min(PREJUMP_PRICE_MAX, sf(reference_ask) + LIVE_ENTRY_MAX_SLIPPAGE)
+    return min(PRELEAD_PRICE_MAX, sf(reference_ask) + LIVE_ENTRY_MAX_SLIPPAGE)
 
 
 def _asset_tick_size(asset):
@@ -3063,43 +3095,33 @@ def _normalize_live_limit_price(asset, price, side):
 
 
 async def _live_entry_retry_valid(condition, variant, asset, outcome, reference_ask):
-    """Revalidate a deterministic NO_MATCH before one optional fast retry.
+    """Optional PRE_LEAD_SAFE NO_MATCH retry validator.
 
-    The retry is allowed only while the same PRE-JUMP direction is still strong,
-    the market is still inside its entry time window, and a fresh REST ask is
-    within both the strategy price band and the original signal slippage cap.
+    Default retries are disabled for parity with the v1.7 live-sim, which modeled
+    one taker attempt. If explicitly enabled, a retry is allowed only while the
+    same direction remains at least PRELEAD_MIN_SCORE with enough fresh votes.
+    Crossing the old 0.40 target is allowed: it means the early signal matured.
     """
     market = markets.get(condition)
     if not market:
         return False, "market_missing"
-
     elapsed = time.time() - sf(market.get("start_ts"))
-    if not (PREJUMP_MIN_ELAPSED <= elapsed <= PREJUMP_MAX_ELAPSED):
+    if not (PRELEAD_MIN_ELAPSED <= elapsed <= PRELEAD_MAX_ELAPSED):
         return False, "outside_entry_window"
-
     feature = latest_feature(variant["symbol"])
-    if not feature or si(feature.get("fresh_venues")) < PREJUMP_MIN_VENUES:
+    if not feature or si(feature.get("fresh_venues")) < PRELEAD_MIN_VENUES:
         return False, "external_sources_not_fresh"
-
     ext_score = sf(feature.get("ext_score"))
     current_outcome = "Up" if ext_score > 0 else "Down"
     if current_outcome != outcome:
         return False, "direction_changed"
-
     directional = directional_external(feature, outcome)
-    threshold = prejump_score()
-    if directional["score"] + 1e-12 < threshold:
+    if directional["score"] + 1e-12 < PRELEAD_MIN_SCORE:
         return False, "score_faded"
-    if directional["same_votes"] < PREJUMP_MIN_VENUES:
+    if directional["same_votes"] < PRELEAD_MIN_VENUES:
         return False, "venue_votes_faded"
-    if PREJUMP_REQUIRE_BINANCE_BYBIT and not (
-        directional["binance_same"] and directional["bybit_same"]
-    ):
+    if PREJUMP_REQUIRE_BINANCE_BYBIT and not (directional["binance_same"] and directional["bybit_same"]):
         return False, "binance_bybit_confirmation_faded"
-
-    # Price/book validity is checked again inside execute_live_fak immediately
-    # before submission using a forced REST snapshot. Avoid doing two sequential
-    # REST calls here because PRE-JUMP latency matters.
     return True, "ok"
 
 
@@ -3169,7 +3191,6 @@ def _tp_latency_line(condition, variant_name):
     if ctx.get("signal_to_response_ms") is not None:
         bits.append(f"event→resp {si(ctx.get('signal_to_response_ms'))}ms")
     return " | ".join(bits)
-
 
 async def execute_live_fak(
     condition, variant, asset, outcome, reason, action, wanted,
@@ -3247,7 +3268,7 @@ async def execute_live_fak(
             log.error("LIVE FAIL-CLOSED %s %s %s: previous submission is ambiguous", name, action, reason)
             return {"ok": False, "filled": 0.0, "error": "previous_submission_ambiguous"}
 
-        # ULTRA-LOW-LATENCY PRE-JUMP execution:
+        # ULTRA-LOW-LATENCY PRE_LEAD_SAFE execution:
         # - FIRST uses the already-validated WS book from signal acceptance;
         # - deterministic NO_MATCH retry uses the latest WS book immediately;
         # - REST is only used when explicitly requested for rollback/diagnostics.
@@ -3282,7 +3303,7 @@ async def execute_live_fak(
             cap = _entry_price_cap(reference_price)
             if best_now is None:
                 return {"ok": False, "filled": 0.0, "error": "no_visible_liquidity"}
-            if best_now < PREJUMP_PRICE_MIN - 1e-12 or best_now > PREJUMP_PRICE_MAX + 1e-12:
+            if best_now < PRELEAD_PRICE_MIN - 1e-12 or best_now > PRELEAD_PRICE_MAX + 1e-12:
                 return {
                     "ok": False, "filled": 0.0,
                     "error": f"entry_price_outside_band:{best_now:.4f}",
@@ -3683,11 +3704,11 @@ async def execute_paper(condition, variant, asset, outcome, signal_type):
 
 
 def _prejump_signal_snapshot(condition, variant_name):
-    """Read the already-accepted PRE-JUMP signal for post-execution diagnostics only."""
+    """Read the already-accepted PRE_LEAD_SAFE signal for post-execution diagnostics only."""
     with db() as conn:
         row = conn.execute(
             """SELECT signal_ms,symbol,outcome,pm_ask,pm_bid,pm_momentum,ext_score,
-                      same_votes,opposing_votes,fresh_venues,elapsed_sec,threshold
+                      same_votes,opposing_votes,fresh_venues,elapsed_sec,threshold,features_json
                FROM prejump_signals
                WHERE condition_id=? AND variant=?
                ORDER BY id DESC LIMIT 1""",
@@ -3717,10 +3738,23 @@ async def _notify_live_entry_not_filled(
     votes = snap.get("same_votes")
     fresh = snap.get("fresh_venues")
     elapsed = snap.get("elapsed_sec")
+    projected = delta = prev_score = None
+    try:
+        payload = json.loads(str(snap.get("features_json") or "{}"))
+        pd = payload.get("prelead") or {}
+        projected = pd.get("projected_score")
+        delta = pd.get("score_delta")
+        prev_score = pd.get("score_prev")
+    except Exception:
+        pass
 
     signal_bits = []
     if score is not None:
         signal_bits.append(f"score {sf(score):.3f}")
+    if projected is not None:
+        signal_bits.append(f"projected {sf(projected):.3f}")
+    if delta is not None:
+        signal_bits.append(f"delta {sf(delta):+.3f}")
     if mom is not None:
         signal_bits.append(f"mom {sf(mom):+.3f}")
     if votes is not None:
@@ -3745,7 +3779,7 @@ async def _notify_live_entry_not_filled(
         + " | ".join(price_bits)
         + (f"\n⏱ {timing}" if timing else "")
         + f"\n{stage}: {str(error or 'not_filled')[:500]}\n"
-        + "No position opened. PRE-JUMP ENTRY rules were not changed."
+        + "No position opened. PRE-LEAD-SAFE ENTRY rules were not changed."
     )
 
 
@@ -3777,7 +3811,7 @@ async def execute_order(
     # failures remain fail-closed inside execute_live_fak. v20.11 revalidates the
     # accepted direction and retries immediately from the latest WS book. No REST
     # RTT is inserted unless LIVE_ENTRY_RETRY_FORCE_REST=1 is explicitly set.
-    if not result.get("retryable") or LIVE_ENTRY_NO_MATCH_RETRIES <= 0:
+    if not result.get("retryable") or PRELEAD_LIVE_NO_MATCH_RETRIES <= 0:
         if str(result.get("status") or "") != "REJECTED_LOCAL":
             await _notify_live_entry_not_filled(
                 condition, variant, asset, outcome, reference_price,
@@ -3786,7 +3820,7 @@ async def execute_order(
         return False
 
     last_reason = "no_match"
-    for attempt in range(1, LIVE_ENTRY_NO_MATCH_RETRIES + 1):
+    for attempt in range(1, PRELEAD_LIVE_NO_MATCH_RETRIES + 1):
         if LIVE_ENTRY_RETRY_DELAY_MS:
             await asyncio.sleep(LIVE_ENTRY_RETRY_DELAY_MS / 1000.0)
         valid, last_reason = await _live_entry_retry_valid(
@@ -3811,7 +3845,7 @@ async def execute_order(
                 await tg_send(
                     f"✅ LIVE ENTRY RETRY FILLED {variant['symbol']}\n"
                     f"{outcome}: {sf(retry.get('filled')):.4f}sh @ "
-                    f"{sf(retry.get('avg')):.4f} | retry {attempt}/{LIVE_ENTRY_NO_MATCH_RETRIES}"
+                    f"{sf(retry.get('avg')):.4f} | retry {attempt}/{PRELEAD_LIVE_NO_MATCH_RETRIES}"
                 )
             return True
         if not retry.get("retryable"):
@@ -3838,6 +3872,74 @@ def pm_fast_momentum(condition, asset, seconds=1.0):
     return sf(h[-1][1]) - sf(prior[1])
 
 
+def _prelead_prior(symbol, current_ms):
+    hist = lead_feature_history[symbol]
+    if len(hist) < 2:
+        return None
+    target_ms = int(current_ms) - PRELEAD_LOOKBACK_MS
+    candidates = [x for x in hist if si(x.get("sample_ms")) < int(current_ms)]
+    if not candidates:
+        return None
+    prior = min(candidates, key=lambda x: abs(si(x.get("sample_ms")) - target_ms))
+    if abs(si(prior.get("sample_ms")) - target_ms) > PRELEAD_HISTORY_TOLERANCE_MS:
+        return None
+    return prior
+
+
+def prelead_projection(symbol, feature, outcome):
+    if not feature:
+        return False, {"reason": "feature_missing"}
+    now_sample_ms = si(feature.get("sample_ms"), now_ms())
+    prior = _prelead_prior(symbol, now_sample_ms)
+    if not prior:
+        return False, {"reason": "history_missing"}
+    sign = 1.0 if str(outcome).upper() == "UP" else -1.0
+    score_now = sign * sf(feature.get("ext_score"))
+    score_prev = sign * sf(prior.get("ext_score"))
+    actual_lookback_ms = max(1, now_sample_ms - si(prior.get("sample_ms")))
+    delta = score_now - score_prev
+    projected = score_now + delta * (PRELEAD_HORIZON_MS / actual_lookback_ms)
+    passed, reason = True, "ok"
+    if score_now < PRELEAD_MIN_SCORE:
+        passed, reason = False, "score_below_lead_min"
+    elif score_now >= PRELEAD_TARGET_SCORE - 1e-12:
+        passed, reason = False, "target_already_crossed"
+    elif score_prev <= 0:
+        passed, reason = False, "prior_not_same_direction"
+    elif delta + 1e-12 < PRELEAD_MIN_DELTA:
+        passed, reason = False, "delta_too_small"
+    elif projected + 1e-12 < PRELEAD_TARGET_SCORE:
+        passed, reason = False, "projection_below_target"
+    return passed, {
+        "reason": reason, "score_now": score_now, "score_prev": score_prev,
+        "score_delta": delta, "actual_lookback_ms": actual_lookback_ms,
+        "configured_lookback_ms": PRELEAD_LOOKBACK_MS, "horizon_ms": PRELEAD_HORIZON_MS,
+        "projected_score": projected, "target_score": PRELEAD_TARGET_SCORE,
+        "min_score": PRELEAD_MIN_SCORE, "min_delta": PRELEAD_MIN_DELTA,
+    }
+
+
+def prelead_safe_filter(diag, ask):
+    if not diag:
+        return False, "diag_missing"
+    if sf(diag.get("projected_score")) + 1e-12 < PRELEAD_SAFE_PROJECTED_SCORE:
+        return False, "safe_projection_below_min"
+    if ask is None or sf(ask) > PRELEAD_SAFE_PRICE_MAX + 1e-12:
+        return False, "safe_price_above_max"
+    return True, "ok"
+
+
+def prelead_pm_momentum(condition_id, asset, seconds=1.0):
+    h = lead_pm_history[condition_id][asset]
+    if len(h) < 2:
+        return None
+    target = now_ms() - int(seconds * 1000)
+    prior = min(h, key=lambda x: abs(x[0] - target))
+    if abs(prior[0] - target) > 350:
+        return None
+    return sf(h[-1][1]) - sf(prior[1])
+
+
 def store_prejump_signal(market, variant, asset, outcome, ask, bid, mom, elapsed, threshold, feature, directional):
     with db() as conn:
         conn.execute("""
@@ -3856,158 +3958,114 @@ def store_prejump_signal(market, variant, asset, outcome, ask, bid, mom, elapsed
 
 
 async def _evaluate_prejump_variant_unlocked(market, variant, elapsed, feature):
-    """One-shot PRE-JUMP gate using the lab's forward-tested 0.40 family."""
+    """One-shot PRE_LEAD_SAFE gate copied from the v1.7 forward-test branch.
+
+    IMPORTANT: LIVE submits immediately after the early signal. There is no local
+    250ms sleep; the live-sim delay existed only to model Polymarket's taker hold.
+    """
     cid = market["condition_id"]
     st = get_variant_state(cid, variant)
     if st.get("stopped_out") or st.get("take_profit_closed"):
         return False
     if st["gate_decided"] or st["started_sides"]:
         return False
-    if not (PREJUMP_MIN_ELAPSED <= elapsed <= PREJUMP_MAX_ELAPSED):
+    if not (PRELEAD_MIN_ELAPSED <= elapsed <= PRELEAD_MAX_ELAPSED):
         return False
-    if not feature or si(feature.get("fresh_venues")) < PREJUMP_MIN_VENUES:
+    if not feature or si(feature.get("fresh_venues")) < PRELEAD_MIN_VENUES:
         return False
 
-    threshold = prejump_score()
     ext_score = sf(feature.get("ext_score"))
-    if abs(ext_score) + 1e-12 < threshold:
+    if abs(ext_score) + 1e-12 < PRELEAD_MIN_SCORE:
         return False
-
     outcome = "Up" if ext_score > 0 else "Down"
     asset = market["up_asset"] if outcome == "Up" else market["down_asset"]
     directional = directional_external(feature, outcome)
-    if directional["score"] + 1e-12 < threshold:
+    if directional["same_votes"] < PRELEAD_MIN_VENUES:
         return False
-    if directional["same_votes"] < PREJUMP_MIN_VENUES:
-        return False
-    if PREJUMP_REQUIRE_BINANCE_BYBIT and not (
-        directional["binance_same"] and directional["bybit_same"]
-    ):
+    if PREJUMP_REQUIRE_BINANCE_BYBIT and not (directional["binance_same"] and directional["bybit_same"]):
         return False
 
-    # Entry is accepted only on a fresh, non-crossed Polymarket book.
+    passed, diag = prelead_projection(variant["symbol"], feature, outcome)
+    if not passed:
+        return False
+
+    # Preserve v20.12 real-money book safety. Usually this is the current WS book;
+    # REST is used only if missing/stale/crossed, never on every signal.
     bid, ask, age = await _refresh_entry_book_if_needed(asset)
-    if ask is None or not (PREJUMP_PRICE_MIN <= ask <= PREJUMP_PRICE_MAX):
+    if ask is None or not (PRELEAD_PRICE_MIN <= ask <= PRELEAD_PRICE_MAX):
         return False
-
-    # Re-sample the latest ask after any REST refresh. The 1s momentum gate is
-    # deliberately identical to the research bot: -0.01..+0.05.
-    fast_pm_history[cid][asset].append((now_ms(), ask))
-    mom = pm_fast_momentum(cid, asset, 1.0)
-    if mom is None or not (PREJUMP_PM_MOM_MIN <= mom <= PREJUMP_PM_MOM_MAX):
-        return False
-
-    # Token-specific SAFE filters. IMPORTANT: these are FIRST-base-signal
-    # filters. The base candidate above is still the normal PRE-JUMP family
-    # (global score/ask/momentum/votes/time). Once the first otherwise-valid
-    # candidate appears for a filtered token, it is either accepted immediately
-    # or the 5-minute market is skipped permanently. No later "better" signal
-    # is allowed to resurrect the market.
-    symbol = str(variant.get("symbol", "")).upper()
-    safe_ok = True
-    safe_reason = ""
-    safe_detail = ""
-
-    if symbol == "BTC":
-        score_ok = directional["score"] + 1e-12 >= BTC_PREJUMP_SCORE
-        ask_ok = ask <= BTC_PREJUMP_PRICE_MAX + 1e-12
-        safe_ok = score_ok and ask_ok
-        if not safe_ok:
-            if not score_ok and not ask_ok:
-                safe_reason = "BTC_FIRST_SIGNAL_FILTER_SCORE_AND_ASK"
-            elif not score_ok:
-                safe_reason = "BTC_FIRST_SIGNAL_FILTER_SCORE"
-            else:
-                safe_reason = "BTC_FIRST_SIGNAL_FILTER_ASK"
-        safe_detail = (
-            f"score={directional['score']:+.3f} need>={BTC_PREJUMP_SCORE:.3f} | "
-            f"ask={ask:.3f} max={BTC_PREJUMP_PRICE_MAX:.2f}"
-        )
-    elif symbol == "SOL":
-        safe_ok = mom <= SOL_PREJUMP_PM_MOM_MAX + 1e-12
-        safe_reason = "SOL_FIRST_SIGNAL_FILTER_MOM_MAX" if not safe_ok else ""
-        safe_detail = f"pmMom={mom:+.3f} max={SOL_PREJUMP_PM_MOM_MAX:+.3f}"
-    elif symbol == "XRP":
-        safe_ok = directional["score"] + 1e-12 >= XRP_PREJUMP_SCORE
-        safe_reason = "XRP_FIRST_SIGNAL_FILTER_SCORE" if not safe_ok else ""
-        safe_detail = f"score={directional['score']:+.3f} need>={XRP_PREJUMP_SCORE:.3f}"
-    elif symbol == "BNB":
-        safe_ok = mom + 1e-12 >= BNB_PREJUMP_PM_MOM_MIN
-        safe_reason = "BNB_FIRST_SIGNAL_FILTER_MOM_MIN" if not safe_ok else ""
-        safe_detail = f"pmMom={mom:+.3f} min={BNB_PREJUMP_PM_MOM_MIN:+.3f}"
-    elif symbol == "DOGE":
-        spread = None if bid is None else ask - bid
-        safe_ok = spread is not None and spread >= -1e-12 and spread <= DOGE_PREJUMP_MAX_SPREAD + 1e-12
-        safe_reason = "DOGE_FIRST_SIGNAL_FILTER_SPREAD" if not safe_ok else ""
-        spread_text = "n/a" if spread is None else f"{spread:.3f}"
-        safe_detail = f"spread={spread_text} max={DOGE_PREJUMP_MAX_SPREAD:.3f} | bid={bid} ask={ask:.3f}"
-    elif symbol == "ETH":
-        score_ok = directional["score"] + 1e-12 >= ETH_PREJUMP_SCORE
-        mom_ok = mom <= ETH_PREJUMP_PM_MOM_MAX + 1e-12
-        safe_ok = score_ok and mom_ok
-        if not safe_ok:
-            if not score_ok and not mom_ok:
-                safe_reason = "ETH_FIRST_SIGNAL_FILTER_SCORE_AND_MOM"
-            elif not score_ok:
-                safe_reason = "ETH_FIRST_SIGNAL_FILTER_SCORE"
-            else:
-                safe_reason = "ETH_FIRST_SIGNAL_FILTER_MOM_MAX"
-        safe_detail = (
-            f"score={directional['score']:+.3f} need>={ETH_PREJUMP_SCORE:.3f} | "
-            f"pmMom={mom:+.3f} max={ETH_PREJUMP_PM_MOM_MAX:+.3f}"
-        )
-
+    safe_ok, safe_reason = prelead_safe_filter(diag, ask)
     if not safe_ok:
-        st["gate_decided"] = True
-        st["gate_passed"] = False
-        st["gate_asset"] = asset
-        ref = ask - mom
-        store_gate_decision(cid, variant, asset, outcome, ask, ref, mom, elapsed, False, safe_reason)
-        log.warning(
-            "%s FIRST-SIGNAL SAFE SKIP %s | %s | elapsed=%.2fs | %s",
-            symbol, outcome, safe_detail, elapsed, safe_reason,
-        )
         return False
 
-    # One signal / one execution attempt per market. Mark the gate BEFORE a
-    # LIVE submission: a timeout/ambiguous response must never cause a duplicate.
+    lead_pm_history[cid][asset].append((now_ms(), ask))
+    mom = prelead_pm_momentum(cid, asset, 1.0)
+    if mom is None or not (PRELEAD_PM_MOM_MIN <= mom <= PRELEAD_PM_MOM_MAX):
+        return False
+
     signal_detected_ms = now_ms()
-    event_received_ms = si(feature.get("_event_received_ms"), 0) if feature else 0
-    evaluation_path = str((feature or {}).get("_evaluation_path") or "timer")
+    evaluation_path = "prelead_100ms"
+    enriched = dict(feature)
+    diag = dict(diag)
+    diag.update({
+        "safe_filter": True, "safe_reason": safe_reason,
+        "safe_projected_score_min": PRELEAD_SAFE_PROJECTED_SCORE,
+        "safe_price_max": PRELEAD_SAFE_PRICE_MAX,
+        "live_local_delay_ms": 0,
+    })
+    enriched["prelead"] = diag
+
+    # Binding first valid SAFE signal: mark BEFORE any real submission to preserve
+    # fail-closed duplicate protection on timeout/ambiguous API responses.
     st["gate_decided"] = True
     st["gate_passed"] = True
     st["gate_asset"] = asset
     ref = ask - mom
-    reason = "PREJUMP_EXTERNAL_OK_EARLY" if elapsed < 5.0 else "PREJUMP_EXTERNAL_OK"
+    reason = "PRELEAD_SAFE_FILTER_OK"
     store_gate_decision(cid, variant, asset, outcome, ask, ref, mom, elapsed, True, reason)
     store_signal(cid, variant, asset, outcome, ask, ref, mom, "ENTRY", elapsed)
     store_prejump_signal(
         market, variant, asset, outcome, ask, bid, mom, elapsed,
-        threshold, feature, directional,
+        PRELEAD_SAFE_PROJECTED_SCORE, enriched, directional,
     )
 
     log.warning(
-        "PREJUMP SIGNAL %-4s %s ask=%.3f bid=%s pmMom=%+.3f | ext=%+.3f threshold=%.2f votes=%d | elapsed=%.2fs",
-        variant["symbol"], outcome, ask,
-        f"{bid:.3f}" if bid is not None else "n/a", mom,
-        directional["score"], threshold, directional["same_votes"], elapsed,
+        "PRE_LEAD_SAFE SIGNAL %-4s %s ask=%.3f bid=%s pmMom=%+.3f | "
+        "score %.3f<-%.3f delta=%+.3f projected=%.3f | votes=%d | elapsed=%.2fs | submit=immediate",
+        variant["symbol"], outcome, ask, f"{bid:.3f}" if bid is not None else "n/a", mom,
+        diag["score_now"], diag["score_prev"], diag["score_delta"], diag["projected_score"],
+        directional["same_votes"], elapsed,
     )
+
+    # PAPER mode inside this live build optionally pays the same 250ms simulated
+    # delay as the lab. LIVE deliberately does not: Polymarket supplies the hold.
+    if strategy_mode(variant["name"]) == "PAPER" and PRELEAD_PAPER_SIM_DELAY_MS > 0:
+        await asyncio.sleep(PRELEAD_PAPER_SIM_DELAY_MS / 1000.0)
+        current_ask = best_ask(asset)
+        cap = _entry_price_cap(ask)
+        if current_ask is None or current_ask > cap + 1e-12 or current_ask > PRELEAD_PRICE_MAX + 1e-12:
+            log.warning(
+                "PRE_LEAD_SAFE PAPER NO FILL %-4s %s | signal ask=%.3f current=%s cap=%.3f",
+                variant["symbol"], outcome, ask,
+                f"{current_ask:.3f}" if current_ask is not None else "n/a", cap,
+            )
+            return False
+
     filled = await execute_order(
         cid, variant, asset, outcome, "ENTRY", reference_price=ask,
-        signal_detected_ms=signal_detected_ms,
-        event_received_ms=event_received_ms or None,
+        signal_detected_ms=signal_detected_ms, event_received_ms=None,
         evaluation_path=evaluation_path,
     )
     if not filled:
         log.warning(
-            "PREJUMP NO FILL %-4s %s | gate remains closed for this market (duplicate-safe)",
+            "PRE_LEAD_SAFE NO FILL %-4s %s | gate remains closed for this market (duplicate-safe)",
             variant["symbol"], outcome,
         )
     return bool(filled)
 
 
 async def evaluate_prejump_variant(market, variant, elapsed, feature):
-    """Race-safe entry gate shared by timer and event-driven evaluators."""
+    """Race-safe PRE_LEAD_SAFE entry gate; validated path is the 100ms timer."""
     key = (market["condition_id"], variant["name"])
     async with prejump_eval_locks[key]:
         return await _evaluate_prejump_variant_unlocked(market, variant, elapsed, feature)
@@ -4081,40 +4139,12 @@ def record_position_trajectory(market, variant, elapsed):
 
 
 async def _event_driven_evaluate_symbol_once(symbol, trigger_ms=None):
-    """Evaluate LIVE PRE-JUMP immediately after an external WS update.
+    """PRE_LEAD_SAFE forward-test parity: external events do not create entries.
 
-    Signal thresholds are unchanged. PAPER is intentionally left on the timer path
-    so the research comparison is not silently changed.
+    The validated branch sampled/projection-tested on a 100ms cadence. Execution
+    after a qualifying timer signal is still ultra-low-latency.
     """
-    if not EVENT_DRIVEN_LIVE_ENTRY or not trading_enabled():
-        return False
-    live_variants = [v for v in STRATEGIES_BY_SYMBOL.get(symbol, []) if strategy_mode(v["name"]) == "LIVE"]
-    if not live_variants:
-        return False
-
-    t_ms = now_ms()
-    t_s = time.time()
-    feature = build_external_snapshot(symbol, t_ms)
-    feature["_evaluation_path"] = "event"
-    feature["_event_received_ms"] = si(trigger_ms, t_ms) or t_ms
-    # Do not append venue_sample_history here: its 1/3/10s reference cadence remains
-    # the stable 100ms timer cadence. Current trade/book/flow state is nevertheless
-    # fresh because build_external_snapshot reads the just-updated in-memory feeds.
-    feature_history[symbol].append(feature)
-
-    any_eval = False
-    for cid, market in list(markets.items()):
-        if market_symbol(market) != symbol:
-            continue
-        elapsed = t_s - market["start_ts"]
-        if not (PREJUMP_MIN_ELAPSED <= elapsed <= PREJUMP_MAX_ELAPSED):
-            continue
-        for variant in live_variants:
-            if variant not in strategies_for_market(market):
-                continue
-            any_eval = True
-            await evaluate_prejump_variant(market, variant, elapsed, feature)
-    return any_eval
+    return False
 
 
 async def event_driven_symbol_loop(symbol):
@@ -4184,7 +4214,7 @@ async def event_driven_live_tp_asset_loop(asset):
 
 
 async def strategy_loop():
-    """100ms fallback scorer + PAPER path; event-driven loops handle LIVE first."""
+    """Validated 100ms PRE_LEAD_SAFE scorer; LIVE submits immediately on signal."""
     while True:
         started = time.monotonic()
         t_s = time.time()
@@ -4199,6 +4229,7 @@ async def strategy_loop():
                     append_venue_feature_history(venue, symbol, feature.get(venue))
                 feature["_evaluation_path"] = "timer"
                 feature_history[symbol].append(feature)
+                lead_feature_history[symbol].append(feature)
                 current_features[symbol] = feature
 
             for cid, market in list(markets.items()):
@@ -4211,6 +4242,7 @@ async def strategy_loop():
                     ask = best_ask(asset)
                     if ask is not None:
                         fast_pm_history[cid][asset].append((t_ms, ask))
+                        lead_pm_history[cid][asset].append((t_ms, ask))
 
                 variants = strategies_for_market(market)
                 for variant in variants:
@@ -4233,13 +4265,13 @@ async def strategy_loop():
                     # signal that is qualifying at that later moment.
                     if strategy_mode(variant["name"]) == "OFF":
                         continue
-                    if not (PREJUMP_MIN_ELAPSED <= elapsed <= PREJUMP_MAX_ELAPSED):
+                    if not (PRELEAD_MIN_ELAPSED <= elapsed <= PRELEAD_MAX_ELAPSED):
                         continue
                     feature = current_features.get(variant["symbol"])
                     await evaluate_prejump_variant(market, variant, elapsed, feature)
 
         except Exception:
-            log.exception("PRE-JUMP strategy loop failed")
+            log.exception("PRE_LEAD_SAFE strategy loop failed")
 
         spent = time.monotonic() - started
         await asyncio.sleep(max(0.02, FAST_INTERVAL - spent))
@@ -4568,8 +4600,8 @@ def keyboard():
             [{"text": "🎛 MODES"}, {"text": "📐 SIZES"}],
             [{"text": "💰 BALANCE"}, {"text": "📈 POSITIONS"}],
             [{"text": "📊 STATISTICS"}, {"text": "📜 TRADES"}],
-            [{"text": "🎯 TAKE PROFIT"}, {"text": "🔐 WALLET"}],
-            [{"text": "➖ SCORE"}, {"text": "🎚 SCORE"}, {"text": "➕ SCORE"}],
+            [{"text": "🔐 WALLET"}],
+            [{"text": "➖ TP"}, {"text": "🎯 TAKE PROFIT"}, {"text": "➕ TP"}],
             [{"text": "🚨 EMERGENCY STOP"}],
         ],
         "resize_keyboard": True,
@@ -4628,11 +4660,10 @@ def _source_summary():
 async def send_modes():
     wallet_flag = "READY" if live_client_ready else f"NOT READY ({live_client_error or 'no credentials'})"
     await tg_send(
-        "🎛 PRE-JUMP MODES\n"
+        "🎛 PRE-LEAD-SAFE MODES\n"
         + "\n".join(strategy_status_line(v) for v in STRATEGIES)
-        + f"\n\nScore: >= {prejump_score():.2f} | window {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s"
-        + f"\nPM ask: {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f} | votes >= {PREJUMP_MIN_VENUES}"
-        + f"\n{safe_first_signal_filter_text()}"
+        + f"\n\nEARLY score: {PRELEAD_MIN_SCORE:.2f}..< {PRELEAD_TARGET_SCORE:.2f} | projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f}"
+        + f"\nSignal ask: {PRELEAD_PRICE_MIN:.2f}–{PRELEAD_SAFE_PRICE_MAX:.2f} | votes >= {PRELEAD_MIN_VENUES} | window {PRELEAD_MIN_ELAPSED:g}–{PRELEAD_MAX_ELAPSED:g}s"
         + f"\nLIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'} | wallet: {wallet_flag}"
         + "\n\nCommands:"
         + "\nMODE BTC PAPER"
@@ -4669,14 +4700,14 @@ async def send_wallet():
         f"LIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'}\n"
         f"Wallet: {wallet}\nSigner: {signer}\nType: {wallet_type}\nCollateral: {bal}\n"
         f"TP: {format_take_profit(take_profit_usdc())}\n"
-        f"PRE-JUMP score: >= {prejump_score():.2f}\n"
+        f"PRE-LEAD-SAFE: score {PRELEAD_MIN_SCORE:.2f}..< {PRELEAD_TARGET_SCORE:.2f}, projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f}, ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}\n"
         f"Error: {live_client_error or '-'}\n\nNever send the private key in Telegram."
     )
 
 
 async def send_balance():
     live_balance = await live_collateral_balance() if live_client_ready else None
-    lines = ["💰 PRE-JUMP BALANCE"]
+    lines = ["💰 PRE-LEAD-SAFE BALANCE"]
     if live_balance is not None:
         lines.append(f"LIVE collateral: ${live_balance:.2f}")
     for v in STRATEGIES:
@@ -4685,7 +4716,7 @@ async def send_balance():
             f"{v['symbol']} {strategy_mode(v['name'])}: PAPER cash ${s['cash']:.2f} | "
             f"realized bot PnL {s['realized']:+.2f}"
         )
-    lines.append(f"Score >= {prejump_score():.2f} | TP {format_take_profit(take_profit_usdc())}")
+    lines.append(f"PRE_LEAD_SAFE projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f} | ask <= {PRELEAD_SAFE_PRICE_MAX:.2f} | TP {format_take_profit(take_profit_usdc())}")
     await tg_send("\n".join(lines))
 
 
@@ -4701,9 +4732,8 @@ def format_stats(v, s):
 
 async def send_statistics():
     lines = [
-        "📊 PRE-JUMP STATISTICS",
-        f"Entries: {'ON' if trading_enabled() else 'OFF'} | base score >= {prejump_score():.2f}",
-        safe_first_signal_filter_text(),
+        "📊 PRE-LEAD-SAFE STATISTICS",
+        f"Entries: {'ON' if trading_enabled() else 'OFF'} | PRE_LEAD_SAFE projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f} | ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}",
     ]
     for v in STRATEGIES:
         lines.append(format_stats(v, account_stats(v["name"])))
@@ -4712,7 +4742,7 @@ async def send_statistics():
 
 
 async def send_positions():
-    lines = ["📈 OPEN PRE-JUMP POSITIONS"]
+    lines = ["📈 OPEN PRE-LEAD-SAFE POSITIONS"]
     found = False
     for v in STRATEGIES:
         for cid in open_condition_ids(v["name"]):
@@ -4746,7 +4776,7 @@ async def send_trades():
             WHERE filled_shares>0 OR status IN ('AMBIGUOUS','DELAYED_AMBIGUOUS')
             ORDER BY ms DESC LIMIT 30
         """).fetchall()
-    lines = ["📜 LAST PRE-JUMP ACTIONS"]
+    lines = ["📜 LAST PRE-LEAD-SAFE ACTIONS"]
     for r in rows:
         v = STRATEGY_BY_NAME.get(str(r["variant"]))
         symbol = v["symbol"] if v else str(r["variant"])
@@ -4795,13 +4825,10 @@ async def request_live(symbol):
         await tg_send(f"🔒 {symbol} has an open position; mode switch blocked until flat.")
         return
     pending_live_confirmations[symbol] = time.time() + 60
-    extra = (
-        f"\n{safe_first_signal_filter_text()}."
-        if symbol == "BTC" else ""
-    )
+    extra = ""
     await tg_send(
         f"⚠️ REAL MONEY confirmation for {symbol}.\n"
-        f"Current PRE-JUMP base score >= {prejump_score():.2f}; ENTRY {entry_shares(v):g} shares."
+        f"PRE-LEAD-SAFE projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f}, signal ask <= {PRELEAD_SAFE_PRICE_MAX:.2f}; ENTRY {entry_shares(v):g} shares."
         f"{extra}\n"
         f"Send exactly: CONFIRM LIVE {symbol}\nExpires in 60 seconds."
     )
@@ -4831,8 +4858,9 @@ async def send_take_profit():
         "🎯 TAKE PROFIT\n"
         f"Current: {format_take_profit(current)}\n"
         f"ENV/default: {format_take_profit(TAKE_PROFIT_USDC)}\n\n"
-        "Change immediately: TP 0.60 | TP 0.90 | TP 1.00\n"
-        "Disable: TP OFF\nReturn to ENV: TP ENV\n\n"
+        f"Buttons ➖/➕ change by ${TAKE_PROFIT_STEP_USDC:.2f}.\n"
+        "Exact value: TP 0.90 | TP 1.00\n"
+        f"Allowed: ${TAKE_PROFIT_MIN_USDC:.2f}..${TAKE_PROFIT_MAX_USDC:.2f}. Disable: TP OFF | Return: TP ENV\n\n"
         "Target is NET profit for the whole remaining position; entry and projected exit fees are included."
     )
 
@@ -4845,8 +4873,8 @@ def _telegram_tp_value(token):
         return "ENV", TAKE_PROFIT_USDC
     cleaned = text.replace("$", "").replace(",", ".")
     value = float(cleaned)
-    if not math.isfinite(value) or value <= 0:
-        raise ValueError("must be greater than 0")
+    if not math.isfinite(value) or value < TAKE_PROFIT_MIN_USDC or value > TAKE_PROFIT_MAX_USDC:
+        raise ValueError("take profit outside allowed range")
     return "VALUE", value
 
 
@@ -4856,7 +4884,7 @@ async def set_take_profit_from_telegram(token):
         _, value = _telegram_tp_value(token)
         new = set_take_profit_usdc(value)
     except Exception:
-        await tg_send("❌ Invalid TP. Examples: TP 0.60 | TP OFF | TP ENV")
+        await tg_send("❌ Invalid TP. Examples: TP 0.90 | TP OFF | TP ENV")
         return
     await tg_send(
         f"✅ TAKE PROFIT UPDATED\n{format_take_profit(old)} → {format_take_profit(new)}\n"
@@ -4866,37 +4894,20 @@ async def set_take_profit_from_telegram(token):
 
 async def send_score():
     await tg_send(
-        "🎚 PRE-JUMP SCORE\n"
-        f"Current entry threshold: >= {prejump_score():.2f}\n"
-        f"Allowed range: {PREJUMP_SCORE_MIN:.2f}–{PREJUMP_SCORE_MAX:.2f}\n"
-        f"ENV/default: {PREJUMP_SCORE_ENV:.2f}\n\n"
-        "Buttons ➖/➕ change by 0.01.\n"
-        "Exact value: SCORE 0.42\nReturn to ENV: SCORE ENV\n\n"
-        "The bot never allows a threshold below 0.40."
+        "🔒 PRE-LEAD-SAFE ENTRY PARAMETERS ARE FIXED\n"
+        f"score now: {PRELEAD_MIN_SCORE:.2f}..< {PRELEAD_TARGET_SCORE:.2f}\n"
+        f"projected score: >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f}\n"
+        f"signal ask: {PRELEAD_PRICE_MIN:.2f}–{PRELEAD_SAFE_PRICE_MAX:.2f}\n"
+        f"score delta: >= +{PRELEAD_MIN_DELTA:.3f} over ~{PRELEAD_LOOKBACK_MS}ms\n\n"
+        "The old PRE-JUMP SCORE control is inactive in v20.13 so the LIVE signal "
+        "cannot accidentally drift away from the forward-tested PRE_LEAD_SAFE rules."
     )
 
 
 async def set_score_from_telegram(token):
-    old = prejump_score()
-    text = str(token or "").strip().upper()
-    try:
-        if text in {"ENV", "DEFAULT"}:
-            value = PREJUMP_SCORE_ENV
-        elif text.startswith("+") or text.startswith("-"):
-            value = old + float(text.replace(",", "."))
-        else:
-            value = float(text.replace(",", "."))
-        new = set_prejump_score(value)
-    except Exception:
-        await tg_send(
-            f"❌ Invalid SCORE. Minimum is {PREJUMP_SCORE_MIN:.2f}. "
-            "Examples: SCORE 0.42 | SCORE +0.01 | SCORE -0.01 | SCORE ENV"
-        )
-        return
-    await tg_send(
-        f"✅ PRE-JUMP SCORE UPDATED\n{old:.2f} → {new:.2f}\n"
-        "Applied immediately to future entry signals; open positions are unchanged."
-    )
+    # Compatibility handler only. Runtime SCORE mutation is intentionally disabled
+    # because v20.13 no longer uses PREJUMP_SCORE for its active entry signal.
+    await send_score()
 
 
 async def handle_tg(text):
@@ -4907,18 +4918,18 @@ async def handle_tg(text):
     if cmd in {"/START", "▶️ START", "START"}:
         state_set("trading_enabled", "1")
         await tg_send(
-            "▶️ PRE-JUMP STARTED\n"
-            f"Base score >= {prejump_score():.2f} | ask {PREJUMP_PRICE_MIN:.2f}–{PREJUMP_PRICE_MAX:.2f} | "
-            f"window {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s\n"
-            f"{safe_first_signal_filter_text()}\n"
-            f">= {PREJUMP_MIN_VENUES} same-side venues | ENTRY default {ENTRY_ORDER_SIZE:g}sh\n"
+            "▶️ PRE-LEAD-SAFE STARTED\n"
+            f"score {PRELEAD_MIN_SCORE:.2f}..< {PRELEAD_TARGET_SCORE:.2f} | projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f}\n"
+            f"signal ask {PRELEAD_PRICE_MIN:.2f}–{PRELEAD_SAFE_PRICE_MAX:.2f} | votes >= {PRELEAD_MIN_VENUES} | "
+            f"window {PRELEAD_MIN_ELAPSED:g}–{PRELEAD_MAX_ELAPSED:g}s\n"
+            f"ENTRY default {ENTRY_ORDER_SIZE:g}sh | LIVE submits immediately; slippage cap +{LIVE_ENTRY_MAX_SLIPPAGE:.2f}\n"
             f"TP {format_take_profit(take_profit_usdc())} | no DCA | no stop-loss."
         )
         return
 
     if cmd in {"⏹ STOP", "STOP", "/STOP"}:
         state_set("trading_enabled", "0")
-        await tg_send("⏹ New PRE-JUMP entries stopped globally. TP monitoring continues for open positions.")
+        await tg_send("⏹ New PRE-LEAD-SAFE entries stopped globally. TP monitoring continues for open positions.")
         return
 
     if cmd in {"🚨 EMERGENCY STOP", "EMERGENCY STOP", "/EMERGENCY"}:
@@ -4938,15 +4949,17 @@ async def handle_tg(text):
     if cmd in {"📐 SIZES", "SIZES"}: await send_sizes(); return
     if cmd in {"🔐 WALLET", "WALLET", "/WALLET"}: await send_wallet(); return
     if cmd in {"🎯 TAKE PROFIT", "TAKE PROFIT", "TAKEPROFIT", "TP", "/TP"}: await send_take_profit(); return
+    if cmd == "➕ TP": await set_take_profit_from_telegram(f"{min(TAKE_PROFIT_MAX_USDC, (take_profit_usdc() or TAKE_PROFIT_USDC or 0.90) + TAKE_PROFIT_STEP_USDC):.2f}"); return
+    if cmd == "➖ TP": await set_take_profit_from_telegram(f"{max(TAKE_PROFIT_MIN_USDC, (take_profit_usdc() or TAKE_PROFIT_USDC or 0.90) - TAKE_PROFIT_STEP_USDC):.2f}"); return
     if cmd in {"🎚 SCORE", "SCORE", "/SCORE"}: await send_score(); return
     if cmd == "➕ SCORE": await set_score_from_telegram("+0.01"); return
     if cmd == "➖ SCORE": await set_score_from_telegram("-0.01"); return
 
-    # SCORE 0.42 / SCORE +0.01 / SCORE ENV
+    # Legacy SCORE commands are read-only in PRE_LEAD_SAFE v20.13.
     if len(parts) == 2 and parts[0] in {"SCORE", "/SCORE"}:
         await set_score_from_telegram(parts[1]); return
 
-    # TP 0.60 / TP OFF / TP ENV
+    # TP 0.90 / TP OFF / TP ENV
     if len(parts) == 2 and parts[0] in {"TP", "/TP", "TAKEPROFIT"}:
         await set_take_profit_from_telegram(parts[1]); return
     if len(parts) == 3 and parts[0] == "TAKE" and parts[1] == "PROFIT":
@@ -4995,8 +5008,7 @@ async def handle_tg(text):
         "Commands:\n"
         "MODE BTC PAPER/LIVE/OFF\nCONFIRM LIVE BTC\n"
         "SIZE BTC 5 | SIZE ALL 5\n"
-        "SCORE 0.42 | SCORE +0.01 | SCORE ENV\n"
-        "TP 0.60 | TP OFF | TP ENV"
+        "TP 0.90 | TP 1.00 | TP OFF | TP ENV"
     )
 
 
@@ -5007,10 +5019,10 @@ async def telegram_loop():
     offset = 0
     await tg_send(
         f"🤖 {VERSION} online\n"
-        f"Tokens: {', '.join(SYMBOLS)} | one PRE-JUMP strategy/token\n"
-        f"Entries: {'ON' if trading_enabled() else 'OFF'} | default modes PAPER\n"
-        f"Base score >= {prejump_score():.2f} | window {PREJUMP_MIN_ELAPSED:g}–{PREJUMP_MAX_ELAPSED:g}s\n"
-        f"{safe_first_signal_filter_text()}\n"
+        f"Tokens: {', '.join(SYMBOLS)} | one PRE-LEAD-SAFE strategy/token\n"
+        f"Entries: {'ON' if trading_enabled() else 'OFF'} | use MODES to inspect/re-arm tokens\n"
+        f"PRE_LEAD_SAFE score {PRELEAD_MIN_SCORE:.2f}..< {PRELEAD_TARGET_SCORE:.2f} | projected >= {PRELEAD_SAFE_PROJECTED_SCORE:.2f}\n"
+        f"signal ask <= {PRELEAD_SAFE_PRICE_MAX:.2f} | window {PRELEAD_MIN_ELAPSED:g}–{PRELEAD_MAX_ELAPSED:g}s\n"
         f"ENTRY default {ENTRY_ORDER_SIZE:g}sh | TP {format_take_profit(take_profit_usdc())}\n"
         f"Wallet: {'READY' if live_client_ready else 'NOT READY'} | LIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'}\n"
         f"Sources: {_source_summary()}"
@@ -5060,25 +5072,23 @@ async def health(request):
         "live_client_ready": live_client_ready,
         "live_client_error": live_client_error,
         "symbols": SYMBOLS,
-        "prejump": {
-            "score": prejump_score(),
-            "score_min": PREJUMP_SCORE_MIN,
-            "price": [PREJUMP_PRICE_MIN, PREJUMP_PRICE_MAX],
-            "pm_momentum_1s": [PREJUMP_PM_MOM_MIN, PREJUMP_PM_MOM_MAX],
-            "min_same_side_venues": PREJUMP_MIN_VENUES,
-            "require_binance_bybit": PREJUMP_REQUIRE_BINANCE_BYBIT,
-            "elapsed_sec": [PREJUMP_MIN_ELAPSED, PREJUMP_MAX_ELAPSED],
-            "fast_interval": FAST_INTERVAL,
-            "first_signal_safe_filters": {
-                "BTC": {"min_score": BTC_PREJUMP_SCORE, "max_signal_ask": BTC_PREJUMP_PRICE_MAX},
-                "SOL": {"max_pm_momentum_1s": SOL_PREJUMP_PM_MOM_MAX},
-                "XRP": {"min_score": XRP_PREJUMP_SCORE},
-                "BNB": {"min_pm_momentum_1s": BNB_PREJUMP_PM_MOM_MIN},
-                "DOGE": {"max_spread": DOGE_PREJUMP_MAX_SPREAD},
-                "ETH": {"min_score": ETH_PREJUMP_SCORE, "max_pm_momentum_1s": ETH_PREJUMP_PM_MOM_MAX},
-                "HYPE": {"filter": None, "mode": "base_prejump_only"},
-                "semantics": "first otherwise-valid base PRE-JUMP candidate; skip market permanently on failure",
-            },
+        "prelead_safe": {
+            "active": True,
+            "score_now": [PRELEAD_MIN_SCORE, PRELEAD_TARGET_SCORE],
+            "projected_score_min": PRELEAD_SAFE_PROJECTED_SCORE,
+            "lookback_ms": PRELEAD_LOOKBACK_MS,
+            "horizon_ms": PRELEAD_HORIZON_MS,
+            "min_delta": PRELEAD_MIN_DELTA,
+            "signal_ask": [PRELEAD_PRICE_MIN, PRELEAD_SAFE_PRICE_MAX],
+            "execution_band_max": PRELEAD_PRICE_MAX,
+            "pm_momentum_1s": [PRELEAD_PM_MOM_MIN, PRELEAD_PM_MOM_MAX],
+            "min_same_side_venues": PRELEAD_MIN_VENUES,
+            "elapsed_sec": [PRELEAD_MIN_ELAPSED, PRELEAD_MAX_ELAPSED],
+            "entry_cadence_sec": FAST_INTERVAL,
+            "event_driven_entry": False,
+            "live_local_delay_ms": 0,
+            "live_no_match_retries": PRELEAD_LIVE_NO_MATCH_RETRIES,
+            "live_entry_slippage_cap": LIVE_ENTRY_MAX_SLIPPAGE,
         },
         "take_profit_usdc_net": take_profit_usdc(),
         "live_tp": {
@@ -5110,9 +5120,29 @@ async def web_server():
     log.info("Health server on :%d", PORT)
 
 
+def apply_v2013_safety_migration():
+    """One-time safety reset because v20.13 changes the ENTRY strategy.
+
+    Preserve the existing SQLite DB and any open positions so TP/settlement remain
+    tracked, but do not silently inherit armed LIVE modes for flat tokens or an
+    already-running START flag from PRE-JUMP. The user must explicitly re-arm LIVE.
+    """
+    key = "migration:v20.13_prelead_safe"
+    if state_get(key, "0") == "1":
+        return False
+    state_set("trading_enabled", "0")
+    for v in STRATEGIES:
+        if not strategy_has_open_position(v["name"]):
+            state_set(f"mode:{v['name']}", "OFF")
+    state_set(key, "1")
+    log.warning("v20.13 safety migration: new entries STOPPED; flat token modes set OFF; open positions preserved")
+    return True
+
+
 async def main():
     global session
     init_db()
+    apply_v2013_safety_migration()
     rebuild_live_tp_watch_assets()
     session = aiohttp.ClientSession(headers={
         "User-Agent": f"PreJumpPaperLive/{VERSION}",
@@ -5135,8 +5165,6 @@ async def main():
     ]
     if LIVE_PREWARM_ENABLE or LIVE_PRESIGN_PREWARM_ENABLE:
         tasks.append(asyncio.create_task(live_prewarm_loop()))
-    if EVENT_DRIVEN_LIVE_ENTRY:
-        tasks += [asyncio.create_task(event_driven_symbol_loop(symbol)) for symbol in SYMBOLS]
     if ENABLE_BINANCE:
         tasks += [asyncio.create_task(binance_symbol_loop(symbol)) for symbol in SYMBOLS]
     if ENABLE_BYBIT:
@@ -5145,19 +5173,15 @@ async def main():
         tasks.append(asyncio.create_task(coinbase_loop()))
 
     log.info(
-        "%s started | symbols=%s | score>=%.2f | window=%.0f..%.0fs | fast=%.2fs | "
-        "event_live=%s/%dms | event_tp=%s/%dms fallback=%.2fs | slippage=%.2f | retry=%d/%dms/rest=%s | transport_prewarm=%s/%.0fs | presign_prewarm=%s/%.0fs | TP=%s | live_master=%s | wallet=%s | trading=%s",
-        VERSION, ",".join(SYMBOLS), prejump_score(), PREJUMP_MIN_ELAPSED, PREJUMP_MAX_ELAPSED,
-        FAST_INTERVAL, "ON" if EVENT_DRIVEN_LIVE_ENTRY else "OFF", EVENT_DRIVEN_MIN_INTERVAL_MS,
+        "%s started | symbols=%s | PRE_LEAD_SAFE score=%.2f..<%.2f projected>=%.2f ask<=%.2f | window=%.0f..%.0fs | cadence=%.2fs | "
+        "event_entry=OFF(parity) | event_tp=%s/%dms fallback=%.2fs | slippage=%.2f | retry=%d | presign_prewarm=%s/%.0fs | TP=%s | live_master=%s | wallet=%s | trading=%s",
+        VERSION, ",".join(SYMBOLS), PRELEAD_MIN_SCORE, PRELEAD_TARGET_SCORE, PRELEAD_SAFE_PROJECTED_SCORE, PRELEAD_SAFE_PRICE_MAX,
+        PRELEAD_MIN_ELAPSED, PRELEAD_MAX_ELAPSED, FAST_INTERVAL,
         "ON" if EVENT_DRIVEN_LIVE_TP else "OFF", LIVE_TP_EVENT_MIN_INTERVAL_MS, TP_CHECK_INTERVAL,
-        LIVE_ENTRY_MAX_SLIPPAGE, LIVE_ENTRY_NO_MATCH_RETRIES, LIVE_ENTRY_RETRY_DELAY_MS,
-        "ON" if LIVE_ENTRY_RETRY_FORCE_REST else "OFF",
-        "ON" if LIVE_PREWARM_ENABLE else "OFF", LIVE_PREWARM_INTERVAL_SEC,
+        LIVE_ENTRY_MAX_SLIPPAGE, PRELEAD_LIVE_NO_MATCH_RETRIES,
         "ON" if LIVE_PRESIGN_PREWARM_ENABLE else "OFF", LIVE_PRESIGN_PREWARM_LEAD_SEC,
-        format_take_profit(take_profit_usdc()),
-        "ON" if LIVE_MASTER_ENABLE else "OFF",
-        "READY" if live_client_ready else "NOT READY",
-        "ON" if trading_enabled() else "OFF",
+        format_take_profit(take_profit_usdc()), "ON" if LIVE_MASTER_ENABLE else "OFF",
+        "READY" if live_client_ready else "NOT READY", "ON" if trading_enabled() else "OFF",
     )
 
     try:

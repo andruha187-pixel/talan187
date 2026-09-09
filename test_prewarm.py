@@ -10,7 +10,7 @@ os.environ['LIVE_PREWARM_INTERVAL_SEC']='15'
 
 spec=importlib.util.spec_from_file_location('bot', os.path.join(os.path.dirname(__file__),'main.py'))
 bot=importlib.util.module_from_spec(spec); spec.loader.exec_module(bot); bot.init_db()
-assert bot.VERSION.startswith('20.12-')
+assert bot.VERSION.startswith('20.13-')
 
 class Balance:
     balance='1000000'
