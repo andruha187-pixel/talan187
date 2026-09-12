@@ -1,84 +1,212 @@
-# PRE-JUMP v20.14 — PJM03 / PJS / PLC
+# Polymarket BTC 15m Up/Down Bot
 
-Version: `20.14-multi7-pjm03-pjs-plc-paper-live`
+Бот для торговли 15-минутными рынками "Bitcoin Up or Down" на Polymarket.
+Заходит в позицию по цене 0.87–0.95, когда набор фильтров (ATR, EMA,
+время до конца рынка, ликвидность стакана) даёт достаточный "safety score".
 
-This build forward-tests three independent candidates on each configured 5-minute crypto token:
+**⚠️ Это торговый бот с реальными деньгами. Рынки Up/Down устроены как
+бинарные ставки: выигрыш ограничен ценой входа, а проигрыш — это полная
+потеря ставки. Даже "безопасный" вход по 0.90 означает, что в среднем
+на дистанции нужен винрейт выше ~90%, просто чтобы выйти в ноль после
+комиссий и проскальзывания. Обязательно погоняй в `DRY_RUN=true` и
+посмотри на статистику в БД, прежде чем включать реальные сделки.**
 
-- `PJM03` — first PRE-JUMP >= 0.40, token-specific SAFE overlay, plus PM momentum <= +0.03.
-- `PJS` — same first PRE-JUMP and token-specific SAFE overlay, without the new +0.03 filter.
-- `PLC` — first PRE_LEAD_SAFE candidate, then a 125 ms confirmation before execution.
+## Как это работает
 
-Default size is **5 shares** and whole-position NET TP is **+$1.05**. Fresh databases start with every branch in PAPER, global entries OFF, and no real order can be sent until LIVE is explicitly enabled and confirmed.
+1. **Определение активного рынка** — вычисляем слаг рынка
+   (`btc-updown-15m-<unix_ts>`) и подтверждаем через Gamma API
+   Polymarket, получаем `condition_id` и ID токенов Up/Down.
+2. **Страйк-цена** — цена BTC на Binance в момент начала 15-минутного
+   окна (именно с ней сравнивается цена на закрытии для резолюции рынка).
+3. **Индикаторы** — ATR(14) и EMA(9/21) на 1-минутных свечах Binance:
+   - расхождение текущей цены от страйка в единицах ATR
+   - подтверждение направления трендом EMA
+   - детект аномального всплеска волатильности (риск разворота)
+4. **Safety score (0–100)** — взвешенная сумма: время до конца рынка,
+   расхождение в ATR, согласованность тренда, режим волатильности,
+   ликвидность в стакане на нужной стороне.
+5. **Вход** — только если цена ask на нужной стороне в диапазоне
+   [`MIN_ENTRY_PRICE`, `MAX_ENTRY_PRICE`] И score выше порога.
+   Ордер — FOK (Fill-Or-Kill), чтобы не оставлять зависшие ордера на
+   рынке с истекающим временем.
+6. **Резолюция** — после закрытия рынка бот сверяется с Gamma API,
+   фиксирует PnL и шлёт итог в Telegram.
+7. **Telegram** — уведомления о каждом входе/резолюции + кнопочное меню
+   управления (`/menu` или `/start`): старт/стоп, размер позиции, стоп-лосс,
+   safety score, режим DRY RUN/LIVE.
 
-## PAPER live-like model
-
-PJM03/PJS accepted signals wait 250 ms before the simulated FAK. PLC waits 125 ms for confirmation and then pays the same 250 ms simulated execution delay. The full requested size must still be visible no worse than the accepted ask +0.05; otherwise the attempt is NO FILL.
-
-PAPER TP waits at least 2 seconds after BUY. When the NET target first becomes executable it freezes the actual sell limit, waits 250 ms, and only fills if the whole remaining size can still sell at that limit or better. NO_MATCH does not create PnL.
-
-## LIVE safety and execution
-
-LIVE keeps the v20.12/v20.13 prewarm/presign, signed LIMIT -> FAK path, deterministic NO_MATCH handling, fail-closed ambiguous submission handling, and FAST EVENT TP. v20.14 also hard-blocks two strategies from being LIVE on the same token at once.
-
-The LIVE price normalizer never uses a tick finer than `LIVE_PRICE_TICK_FALLBACK=0.01`, preventing the ETH-style SDK rejection caused by three-decimal prices when the market accepts only 0.01 ticks.
-
-The BTC post-BUY TP propagation fix is retained: LIVE TP waits 2 seconds by default; an explicit not-enough-balance/allowance rejection is classified as `REJECTED_BALANCE_ALLOWANCE` rather than ambiguous, and later TP cycles may retry safely. The startup migration also repairs old poisoned TP balance-rejection records.
-
-Start with `LIVE_MASTER_ENABLE=0`. Verify `WALLET` reports READY before deliberately enabling LIVE.
-
-## Telegram essentials
-
-`START` / `STOP` control new entries globally.
-
-Examples:
-
-```text
-MODE BTC PJM03 PAPER
-MODE BTC PJM03 LIVE
-CONFIRM LIVE BTC PJM03
-MODE BTC PJS PAPER
-MODE BTC PLC PAPER
-SIZE BTC 5
-SIZE ETH PLC 5
-TP 1.05
-TP OFF
-TP ENV
-MODES
-SIZES
-POSITIONS
-STATISTICS
-TRADES
-WALLET
-```
-
-`SIZE BTC 5` sets all three BTC candidates to 5 shares. `SIZE BTC PLC 5` changes only PLC. PAPER candidates may run simultaneously; only one candidate per token may be LIVE.
-
-## Persistent data
-
-Mount persistent storage at `/var/data`.
-
-- SQLite: `/var/data/prejump_v20_14_candidates.db`
-- hourly report directory: `/var/data/prejump_v20_14_reports`
-
-Hourly Telegram ZIPs contain separate `results_PJM03.csv`, `results_PJS.csv`, and `results_PLC.csv`, plus gates, accepted signals, PLC confirmation checks, PAPER trades/exits, LIVE orders, and `summary.txt`.
-
-## Coolify
-
-Use the included Dockerfile. Application port is `8080`; health endpoint is `/health`. Copy `.env.example` variables into Coolify Environment and keep the private key out of GitHub.
-
-## Regression checks
-
-From the package directory:
+## Установка
 
 ```bash
-python -m py_compile main.py
-python test_v2014_candidates.py
-python test_paper_live_sim.py
-python test_plc_confirm_entry.py
-python test_hourly_report.py
-python test_tick_alignment.py
-python test_live_exec_tp.py
-python test_tp_balance_sync.py
-python test_prewarm.py
-python test_presign_prewarm.py
+git clone <твой-репозиторий>
+cd polymarket-btc-bot
+python3 -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+cp .env.example .env
 ```
+
+Заполни `.env`:
+
+- `TELEGRAM_BOT_TOKEN` — получить у [@BotFather](https://t.me/BotFather)
+- `TELEGRAM_CHAT_ID` — свой chat_id (можно узнать через [@userinfobot](https://t.me/userinfobot))
+- `POLY_PRIVATE_KEY` — приватный ключ торгового кошелька (Polygon).
+  **Используй отдельный кошелёк, не основной**, и держи ключ только в `.env`.
+- `POLY_FUNDER_ADDRESS` — если логинишься в Polymarket через email/Magic
+  или browser-wallet, а не напрямую MetaMask-адресом.
+- Перед реальными сделками на аккаунте должны быть выставлены токен-аллованcы
+  USDC → CTF Exchange контракты (см. документацию py-clob-client в README
+  репозитория [Polymarket/py-clob-client](https://github.com/Polymarket/py-clob-client) —
+  если логинился через email/Magic, это делается автоматически).
+
+## Запуск локально
+
+```bash
+python -m src.main
+```
+
+Обрати внимание: запускать нужно именно так (`python -m src.main` из корня
+проекта), а не `python src/main.py` и не `python main.py` — иначе импорты
+`from src import ...` не найдут пакет `src` (типичная ошибка
+`ModuleNotFoundError: No module named 'src'`).
+
+Пока `DRY_RUN=true` — ордера не отправляются, только логируются сигналы в
+`data/bot.db` (таблица `signals`) и приходят уведомления с пометкой
+"DRY RUN". Это твой инструмент бэктеста: смотри реальную статистику
+срабатываний стратегии на живых данных перед тем, как включать
+`DRY_RUN=false`.
+
+## Управление из Telegram
+
+Напиши боту `/start` или `/menu` — появится кнопочное меню:
+
+- **▶️ Старт / ⏸ Стоп** — пауза новых входов (открытые позиции доигрываются
+  до резолюции в любом случае, пауза не закрывает их досрочно).
+- **💰 Размер позиции** — пресеты 5/10/20/50/100 USDC на сделку. Это
+  максимальный размер — фактическая ставка масштабируется вниз для
+  пограничных сигналов, см. ниже.
+- **🛑 Стоп-лосс** — дневной лимит убытка; при достижении новые входы
+  блокируются до полуночи (UTC). Пресеты + шаг ±10.
+- **📊 Статистика** — число сделок и PnL за сегодня и за всё время.
+- **⚙️ Настройки** — порог safety score, пресеты 65/75/85/90 + шаг ±5: выше —
+  реже и осторожнее входы, ниже — чаще, но рискованнее.
+- **🧪/🔴 режим DRY RUN / LIVE** — включение реальных сделок требует
+  отдельного подтверждения кнопкой, случайным тапом не переключится.
+
+Все изменения сразу пишутся в SQLite (`bot_settings`) и переживают рестарт
+процесса — не только явную остановку тобой, но и, например, редеплой на
+Render или падение контейнера.
+
+## Масштабирование размера ставки по уверенности сигнала
+
+Ставка = 0.87-0.95 — это асимметричная выплата: выигрыш даёт всего 5-15% от
+ставки, проигрыш забирает 100%. На дистанции нужен винрейт не ниже той
+вероятности, которую подразумевает цена входа — то есть сама стратегия
+должна находить реальное статистическое преимущество, а не просто ловить
+цену в диапазоне.
+
+Чтобы не терять по полной ставке на пограничных сигналах (score едва выше
+порога — по определению наименее надёжные), размер сделки линейно
+масштабируется: на score == порогу используется только
+`SIZE_SCALING_MIN_FRACTION` (по умолчанию 30%) от `TRADE_SIZE_USDC`, на
+score >= `SIZE_SCALING_MAX_SCORE` (по умолчанию 95) — полный размер. Видно
+в каждом уведомлении о входе: `Размер: X из Y USDC (score N/порог)`.
+
+Это не убирает риск отрицательного edge — если стратегия в среднем не
+угадывает направление лучше, чем подразумевает цена, скейлинг только
+уменьшит масштаб потерь, а не развернёт их в плюс. Смотри реальную
+статистику по `signals`/`trades` в SQLite, чтобы понять, есть ли edge
+вообще, и калибруй порог/диапазон входа по факту, а не по интуиции.
+
+## Деплой на Render
+
+В репозитории есть `render.yaml` — Render подхватит его автоматически
+при создании Blueprint-сервиса из репозитория. Ключевые моменты, если
+настраиваешь сервис руками через Dashboard:
+
+- **Service type: Background Worker**, не Web Service — у бота нет
+  HTTP-сервера, и Web Service свалится с "no open ports detected".
+- **Root Directory** — оставь пустым (корень репозитория).
+- **Build Command**: `pip install -r requirements.txt`
+- **Start Command**: `python -m src.main`
+- Переменные из `.env` задаются в Environment на вкладке сервиса —
+  сам `.env` в репозиторий не попадает (см. `.gitignore`).
+- `data/bot.db` живёт на локальном диске контейнера — Render Free/Starter
+  план не гарантирует персистентность диска между деплоями. Если важно
+  сохранять историю сигналов между рестартами, добавь Render Disk
+  (Persistent Disk) и примонтируй его в `data/`, либо перейди на внешнюю
+  БД (Postgres) — это можно сделать отдельным шагом, когда понадобится.
+
+## Структура проекта
+
+```
+config.py                  — все настройки из .env
+src/
+  binance_feed.py           — цена и свечи BTC с Binance
+  market_discovery.py       — поиск активного 15m рынка на Polymarket
+  indicators.py             — ATR, EMA, детект волатильности
+  strategy.py                — safety score и решение о входе
+  polymarket_client.py       — обёртка над py-clob-client (orderbook, ордера)
+  storage.py                  — SQLite: сигналы и сделки
+  telegram_notify.py          — уведомления и команды бота
+  executor.py                  — исполнение входа + резолюция сделок
+  main.py                      — основной цикл
+```
+
+## Прогрев стакана и задержка Polymarket
+
+Изначальная версия дёргала `GET /book` REST-запросом на каждом тике —
+это лишние 100-300мс сетевого раунд-трипа именно в момент принятия
+решения, и цена в этот момент могла уже уйти. Плюс сам Polymarket
+обновляет книгу с задержкой относительно бирж вроде Binance — это
+системный лаг, который прогревом не убрать, но убрать свою собственную
+задержку поверх него — можно.
+
+Что добавлено (`src/book_stream.py`):
+
+- **Живой WS-стакан.** При обнаружении рынка бот сразу подписывается на
+  оба токена (Up/Down) через `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+  и держит соединение открытым весь жизненный цикл рынка. К моменту, когда
+  strategy нужна цена — она уже лежит в памяти, обновлённая пушем с сервера,
+  а не тем, что мы только что сходили и спросили. REST остаётся фолбэком,
+  если WS ещё не прогрелся или стакан протух (`is_fresh`, порог 3с).
+- **Выравнивание цены по тику.** Реальный лимит исполнения = `ask + slippage`,
+  округлённый ВНИЗ до шага цены токена (`round_price_for_buy`). Без этого
+  CLOB отклоняет ордер с неправильным шагом цены — и это происходит именно
+  в момент, когда каждая миллисекунда на счету.
+- **Прогрев авторизованного транспорта.** Периодический безобидный
+  read-only запрос баланса (`prewarm_transport`) — прогревает то же самое
+  TLS/auth-соединение, которым пойдёт реальный ордер, без торгового эффекта.
+
+Что **не** перенесено из старого бота, и почему: presign-прогрев (построение
+и подпись фиктивного ордера заранее) актуален для стратегий вроде
+`PRE_LEAD_SAFE` из твоего v20.13, которые гоняются за движением на 5-минутных
+рынках и решают вопрос в первые секунды после сигнала. У нашей стратегии
+окно входа — 2-9 минут из 15, так что выигрыш от presign там не критичен;
+если после недели дрен-рана окажется, что именно последние сотни
+миллисекунд решают судьбу сделок — добавить несложно, дай знать.
+
+## Что стоит донастроить под себя
+
+- **`SAFETY_SCORE_THRESHOLD`, `ATR_DISTANCE_MULT`** — веса и пороги в
+  `strategy.py` подобраны как разумная отправная точка, а не готовый
+  Грааль. Прогони DRY_RUN минимум неделю, выгрузи `signals` из
+  `data/bot.db` и посмотри, как safety score коррелирует с реальным
+  исходом рынка — потом калибруй пороги.
+- **`MAX_OPEN_POSITIONS`** сейчас используется только как параметр
+  конфига; если хочешь торговать несколько активов (`btc,eth,sol`)
+  параллельно — вынеси `ASSET` в список и заведи по циклу на каждый.
+- **Проскальзывание** — сейчас берём `best_ask` из стакана. Если
+  ликвидность у Polymarket на конкретном рынке тонкая, добавь логику
+  усреднения по нескольким уровням стакана в `polymarket_client.get_orderbook`.
+- **Резолюция** через Gamma API — есть небольшая задержка после закрытия
+  окна, пока рынок не помечен `closed=true`. Это нормально, бот просто
+  проверяет на каждом тике и зафиксирует PnL, как только статус обновится.
+
+## Тестирование стратегии автономно (бэктест)
+
+Таблица `signals` в SQLite копит каждый тик независимо от того, был ли
+вход — это готовый датасет для офлайн-анализа (Pandas/Jupyter): можно
+сопоставить исторические safety score с фактическим исходом рынка
+(таблица `trades` после накопления реальных/dry-run входов) и подобрать
+оптимальные пороги до того, как рисковать реальными деньгами.
