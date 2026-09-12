@@ -1,8 +1,0 @@
-__pycache__/
-*.py[cod]
-.env
-.git/
-.gitignore
-*.db
-*.sqlite*
-data/
